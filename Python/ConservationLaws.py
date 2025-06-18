@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import pickle
 from scipy.signal import savgol_filter, find_peaks
+import warnings
 
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -153,18 +154,34 @@ def print_reaction_network(reaction_network):
         print(f"R{idx+1}: {react_str} -> {prod_str}")
       
 
-def compute_ss_response_as_function_of_input(rhs, k_values, y0, t_span, t_eval, input_type, input_idx, input_vals, method = 'LSODA', rtol = 1e-3, atol = 1e-6):
+def compute_ss_response_as_function_of_input(rhs, k_values, y0, t_span, t_eval, input_type, input_idx, input_vals, method = 'LSODA', rtol = 1e-3, atol = 1e-6, time_limit = 10):
     ss_response = []
+    start_time = time.time()
     for input_val in input_vals:
         if input_type == 'rate':
             k_values_copy = k_values.copy()
             k_values_copy[input_idx] = k_values_copy[input_idx] * np.exp(input_val)
-            sol = solve_ivp(rhs, t_span, y0, args=(k_values_copy,), t_eval=t_eval, method=method, rtol=rtol, atol=atol)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", RuntimeWarning)
+                    sol = solve_ivp(rhs, t_span, y0, args=(k_values_copy,), t_eval=t_eval, method=method, rtol=rtol, atol=atol)
+            except RuntimeWarning as e:
+                print(f"Aborted due to RuntimeWarning: {e}")
+                raise
         elif input_type == 'concentration':
             y0_copy = y0.copy()
             y0_copy[input_idx] = input_val
-            sol = solve_ivp(rhs, t_span, y0_copy, args=(k_values,), t_eval=t_eval, method=method, rtol=rtol, atol=atol)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", RuntimeWarning)
+                    sol = solve_ivp(rhs, t_span, y0_copy, args=(k_values,), t_eval=t_eval, method=method, rtol=rtol, atol=atol)
+            except RuntimeWarning as e:
+                print(f"Aborted due to RuntimeWarning: {e}")
+                raise
         ss_response.append(sol.y[:, -1])
+        if time.time() - start_time > time_limit:
+            print(f"Time limit reached for input {input_val}")
+            raise TimeoutError(f"Time limit of {time_limit} seconds reached while computing steady state response for input value {input_val}")
     return np.array(ss_response)
 
 
@@ -235,9 +252,12 @@ def count_turning_points(y, eps=1e-8, window_length=5, polyorder=2, smooth=False
     """
     if smooth:
         y = smooth_curve(y, window_length=window_length, polyorder=polyorder)
+    
     y = np.asarray(y)
+    y_mean = np.mean(y)
     if prominence is None:
         prominence = eps
+
     # Find peaks
     peaks, _ = find_peaks(y, prominence=prominence, wlen=wlen)
     # Find valleys (peaks in -y)
@@ -261,7 +281,6 @@ def count_turning_points_columns(arr, eps=1e-8, window_length=5, polyorder=2, sm
     
     for i in range(n_cols):
         turning_points[i] = count_turning_points(arr[:, i], eps=eps, window_length=window_length, polyorder=polyorder, smooth=smooth, prominence=prominence, wlen=wlen)
-        
     return turning_points
 
 def recompute_turning_points_list(ss_response_list, eps=1e-8, window_length=5, polyorder=2, smooth=False, prominence=None, wlen=None):
@@ -275,6 +294,16 @@ def recompute_turning_points_list(ss_response_list, eps=1e-8, window_length=5, p
     """
     return [[count_turning_points_columns(ss_response, eps=eps, window_length=window_length, polyorder=polyorder, smooth=smooth, prominence=prominence, wlen=wlen) for ss_response in ss_responses] for ss_responses in ss_response_list]
 
+def compute_above_threshold(ss_response_list, threshold):
+    """
+    Given a list of steady-state response arrays, recompute the number of turning points for each entry.
+    Args:
+        ss_response_list (list of np.ndarray): Each entry is a 2D array (responses for one system).
+        eps (float): Threshold for numerical noise in turning point detection.
+    Returns:
+        list of np.ndarray: Each entry is the turning points array for the corresponding ss_response.
+    """
+    return [[np.mean(ss_response, axis=0) < threshold for ss_response in ss_responses] for ss_responses in ss_response_list]
 
 def reaction_network_to_bipartite_graph(reaction_network, n_species):
     G = nx.DiGraph()
@@ -294,7 +323,7 @@ def reaction_network_to_bipartite_graph(reaction_network, n_species):
     return G
 
 
-def export_data_as_apkl(filename, S_list, k_list, odes_list, reaction_network_list, ss_response_list, G_list):
+def export_data_as_apkl(filename, L_list, S_list, k_list, y0_list, k_values_list, odes_list, reaction_network_list, ss_response_list, G_list):
     """
     Exports the provided data lists to a .apkl file using pickle.
     
@@ -303,8 +332,11 @@ def export_data_as_apkl(filename, S_list, k_list, odes_list, reaction_network_li
         S_list, k_list, odes_list, reaction_network_list, turning_points_list, ss_response_list, G_list: Data to export.
     """
     data = {
+        'L_list': L_list,
         'S_list': S_list,
         'k_list': k_list,
+        'y0_list': y0_list,
+        'k_values_list': k_values_list,
         'odes_list': odes_list,
         'reaction_network_list': reaction_network_list,
         'ss_response_list': ss_response_list,
