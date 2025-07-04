@@ -5,131 +5,71 @@ from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 import networkx as nx
 import pickle
-from scipy.signal import savgol_filter, find_peaks
-import warnings
+import string
+import random
+import itertools
+import sympy
+from scipy.optimize import nnls
+from scipy.optimize import minimize
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Dict, Tuple
 
-@dataclass
-class Reaction:
-    reactants: List[Tuple[int, int]]  # (species_index, stoichiometry)
-    products: List[Tuple[int, int]]   # (species_index, stoichiometry)
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
 
-        
-def generate_stoichiometry_matrix(L, n_reactions, reac_order=1, force_reverse_reactions=False, seed=None, timeout = 3):
+import jax
+import jax.numpy as jnp
+from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt
+
+
+def random_connected_graph(n_nodes, n_edges, rng, seed, directed=False):
     """
-    Generate a stoichiometry matrix A given a matrix L (whose nullspace defines conservation laws),
-    the number of reactions, and the maximum reaction order.
-    
+    Generate a random connected graph with n_nodes and n_edges.
+    Uses local numpy and Python RNGs for full reproducibility.
     Args:
-        L: sympy.Matrix, the matrix whose nullspace defines conservation laws
-        n_reac: int, number of reactions (columns in A)
-        reac_order: int, maximum allowed absolute value for stoichiometric coefficients (default 1)
-        seed: int or None, random seed for reproducibility
-        
+        n_nodes: Number of nodes
+        n_edges: Number of edges
+        directed: Whether the graph is directed
+        rng: numpy.random.Generator
+        py_rng: random.Random
     Returns:
-        A: sympy.Matrix, the generated stoichiometry matrix
+        G: networkx Graph or DiGraph
     """
-    if seed is not None:
-        np.random.seed(seed)
-    nullspace = L.nullspace()
-    # Check for non-integer elements in nullspace vectors
-    for v in nullspace:
-        if not all(x == int(x) for x in v):
-            raise ValueError("Nullspace vector contains non-integer elements. Please provide a matrix L with integer nullspace vectors.")
-    n_null = len(nullspace)
-    cols = []
-    sub_start_time = time.time()
-    for m in range(n_reactions):
-        while True:
-            coefs = [np.random.randint(-2, 2) for _ in range(n_null)]  
-            zero_col = sympy.zeros(*nullspace[0].shape)
-            col = sum((c * v for c, v in zip(coefs, nullspace)), zero_col)
-            sum_neg = sum(-x for x in col if x < 0)
-            sum_pos = sum(x for x in col if x > 0)
-            if (
-                all(abs(x) <= reac_order for x in col)
-                and sum_neg <= reac_order
-                and sum_pos <= reac_order
-                and sum_neg != 0
-                and sum_pos != 0
-                and not any(col == existing for existing in cols)
-            ):
-                break
-        
-            if time.time() - sub_start_time > timeout:
-                raise ValueError("Timeout reached while generating stoichiometry matrix.")
-        cols.append(col)
-        if force_reverse_reactions:
-            cols.append(-col)
-    A = sympy.Matrix.hstack(*cols)
-    return A
 
-def build_mass_action_odes(A, Reaction, species_prefix='S', rate_prefix='k'):
-    """
-    Given a stoichiometry matrix A and a Reaction class, build the mass action ODEs.
-    Returns:
-        S: tuple of sympy symbols for species concentrations
-        k: tuple of sympy symbols for rate constants
-        odes: list of sympy expressions for the ODEs
-        reaction_network: list of Reaction objects
-        rate_exprs: list of sympy expressions for reaction rates
-    """
-    n_species = A.shape[0]
-    n_reactions = A.shape[1]
+    nodes = list(range(n_nodes))
+    if directed:
+        G = nx.DiGraph()
+        G.add_nodes_from(nodes)
+        # Generate a random tree and orient edges randomly
+        tree = nx.random_tree(n_nodes, seed=seed)
+        for u, v in tree.edges():
+            if rng.random() < 0.5:
+                G.add_edge(u, v)
+            else:
+                G.add_edge(v, u)
+        # Add extra edges
+        possible_edges = [(i, j) for i in nodes for j in nodes if i != j and not G.has_edge(i, j)]
+        extra_edges_needed = n_edges - (n_nodes - 1)
+        if extra_edges_needed > 0:
+            extra_edges_indices = rng.choice(len(possible_edges), size=extra_edges_needed, replace=False)
+            for idx in extra_edges_indices:
+                u, v = possible_edges[idx]
+                G.add_edge(u, v)
+    else:
+        G = nx.random_tree(n_nodes, seed=seed)
+        # Add extra edges
+        possible_edges = [(i, j) for i in nodes for j in nodes if i < j and not G.has_edge(i, j)]
+        extra_edges_needed = n_edges - (n_nodes - 1)
+        if extra_edges_needed > 0:
+            extra_edges_indices = rng.choice(len(possible_edges), size=extra_edges_needed, replace=False)
+            for idx in extra_edges_indices:
+                u, v = possible_edges[idx]
+                G.add_edge(u, v)
+    return G
 
-    # Build reaction network
-    reaction_network = []
-    for j in range(n_reactions):
-        reactants = []
-        products = []
-        for i in range(n_species):
-            stoich = A[i, j]
-            if stoich < 0:
-                reactants.append((i, -stoich))
-            elif stoich > 0:
-                products.append((i, stoich))
-        reaction_network.append(Reaction(reactants, products))
 
-    # Define symbols
-    S = sympy.symbols(f'{species_prefix}1:{n_species+1}')
-    k = sympy.symbols(f'{rate_prefix}1:{n_reactions+1}')
-
-    # Build rate expressions
-    rate_exprs = []
-    for j, rxn in enumerate(reaction_network):
-        rate = k[j]
-        for idx, stoich in rxn.reactants:
-            rate *= S[idx]**stoich
-        rate_exprs.append(rate)
-
-    # Build ODEs
-    odes = [0 for _ in range(n_species)]
-    for j, rxn in enumerate(reaction_network):
-        rate = rate_exprs[j]
-        for idx, stoich in rxn.reactants:
-            odes[idx] -= stoich * rate
-        for idx, stoich in rxn.products:
-            odes[idx] += stoich * rate
-
-    return S, k, odes, reaction_network, rate_exprs
-
-def random_conservation_laws(n_cons, n_species, probs, seed=None):
-    """
-    Generate a random set of conservation laws as a sympy.Matrix.
-
-    Args:
-        n_cons (int): Number of conservation laws (rows).
-        n_species (int): Number of species (columns).
-        mc (int): Maximum absolute value for integer elements.
-        seed (int or None): Random seed for reproducibility.
-
-    Returns:
-        sympy.Matrix: Matrix of shape (n_cons, n_species).
-    """
-    if seed is not None:
-        np.random.seed(seed)
+def random_conservation_laws(n_cons, n_species, probs):
     L = []
     mc = len(probs)
     for _ in range(n_cons):
@@ -140,273 +80,886 @@ def random_conservation_laws(n_cons, n_species, probs, seed=None):
             if sum(row) != 0:  # Exclude all-zero row
                 not_all_zero = False
         L.append(row)
-    return sympy.Matrix(L)
+    return np.array(L)
 
 
-def print_reaction_network(reaction_network):
-    for idx, rxn in enumerate(reaction_network):
-        react_str = ' + '.join(
-            [ ' + '.join([f"S{r[0]+1}"] * r[1]) for r in rxn.reactants ]
-        ) or '∅'
-        prod_str = ' + '.join(
-            [ ' + '.join([f"S{p[0]+1}"] * p[1]) for p in rxn.products ]
-        ) or '∅'
-        print(f"R{idx+1}: {react_str} -> {prod_str}")
-      
-
-def compute_ss_response_as_function_of_input(rhs, k_values, y0, t_span, t_eval, input_type, input_idx, input_vals, method = 'LSODA', rtol = 1e-3, atol = 1e-6, time_limit = 10):
-    ss_response = []
-    start_time = time.time()
-    for input_val in input_vals:
-        if input_type == 'rate':
-            k_values_copy = k_values.copy()
-            k_values_copy[input_idx] = k_values_copy[input_idx] * np.exp(input_val)
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", RuntimeWarning)
-                    sol = solve_ivp(rhs, t_span, y0, args=(k_values_copy,), t_eval=t_eval, method=method, rtol=rtol, atol=atol)
-            except RuntimeWarning as e:
-                print(f"Aborted due to RuntimeWarning: {e}")
-                raise
-        elif input_type == 'concentration':
-            y0_copy = y0.copy()
-            y0_copy[input_idx] = input_val
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", RuntimeWarning)
-                    sol = solve_ivp(rhs, t_span, y0_copy, args=(k_values,), t_eval=t_eval, method=method, rtol=rtol, atol=atol)
-            except RuntimeWarning as e:
-                print(f"Aborted due to RuntimeWarning: {e}")
-                raise
-        ss_response.append(sol.y[:, -1])
-        if time.time() - start_time > time_limit:
-            print(f"Time limit reached for input {input_val}")
-            raise TimeoutError(f"Time limit of {time_limit} seconds reached while computing steady state response for input value {input_val}")
-    return np.array(ss_response)
-
-
-def smooth_curve(y, window_length=3, polyorder=1):
+def generate_string_vector_dict(n):
     """
-    Applies a Savitzky-Golay filter to smooth a sequence of y-values.
-
-    Parameters:
-        y (array-like): Sequence of y-values at equally spaced x-values.
-        window_length (int): Window length for Savitzky-Golay filter (must be odd and >= polyorder+2).
-        polyorder (int): Polynomial order for Savitzky-Golay filter.
-
-    Returns:
-        array-like: Smoothed y-values.
+    Generates a dictionary mapping complex names (as strings) to their
+    vector representations. Correctly handles complexes like "A+E" and "E+A"
+    as identical by creating a canonical (sorted) representation.
     """
-    y = np.asarray(y)
-    # Ensure window_length is valid
-    if window_length < polyorder + 2:
-        window_length = polyorder + 2
-        if window_length % 2 == 0:
-            window_length += 1
-    if window_length > len(y):
-        window_length = len(y) if len(y) % 2 == 1 else len(y) - 1
-    # Smooth y and compute its first derivative 
-    y_smooth = savgol_filter(y, window_length=window_length, polyorder=polyorder)
-    return y_smooth
+    letters = list(string.ascii_uppercase[:n])
+    letter_indices = {letter: i for i, letter in enumerate(letters)}
+    result = {}
 
+    # Single letters
+    for letter in letters:
+        vec = np.zeros(n, dtype=int)
+        vec[letter_indices[letter]] = 1
+        result[letter] = vec
 
-# def count_turning_points(y, eps=1e-8, window_length=5, polyorder=2, smooth=False):
-#     """
-#     Counts the number of turning points (where the derivative changes sign)
-#     in a sequence of equally spaced points, ignoring small numerical fluctuations.
-
-#     Parameters:
-#         y (array-like): Sequence of y-values at equally spaced x-values.
-#         eps (float): Threshold below which the derivative is considered zero.
-
-#     Returns:
-#         int: Number of turning points.
-#     """
-#     if smooth:
-#         y = smooth_curve(y, window_length=window_length, polyorder=polyorder)
-#     y = np.asarray(y)
-#     dy = np.diff(y)
-#     # Set small derivatives to zero
-#     dy[np.abs(dy) < eps] = 0
-#     sign_dy = np.sign(dy)
-#     # Only count sign changes where both sides are nonzero (not flat)
-#     sign_changes = (sign_dy[1:] * sign_dy[:-1] < 0) & (sign_dy[1:] != 0) & (sign_dy[:-1] != 0)
-#     return np.sum(sign_changes)
-
-def count_turning_points(y, eps=1e-8, window_length=5, polyorder=2, smooth=False, prominence=None, wlen=None):
-    """
-    Counts the number of turning points (peaks + valleys) in a sequence of equally spaced points.
-    Uses scipy.signal.find_peaks for robust detection, with optional smoothing.
-
-    Parameters:
-        y (array-like): Sequence of y-values at equally spaced x-values.
-        eps (float): Minimum height difference to consider a peak/valley (used as prominence if not specified).
-        window_length (int): Window length for smoothing (if smooth=True).
-        polyorder (int): Polynomial order for smoothing (if smooth=True).
-        smooth (bool): Whether to smooth the curve before finding peaks/valleys.
-        prominence (float or None): Prominence parameter for find_peaks. If None, uses eps.
-        wlen (int or None): Window length for find_peaks (in samples).
-
-    Returns:
-        int: Number of turning points (peaks + valleys).
-    """
-    if smooth:
-        y = smooth_curve(y, window_length=window_length, polyorder=polyorder)
-    
-    y = np.asarray(y)
-    y_mean = np.mean(y)
-    if prominence is None:
-        prominence = eps
-
-    # Find peaks
-    peaks, _ = find_peaks(y, prominence=prominence, wlen=wlen)
-    # Find valleys (peaks in -y)
-    valleys, _ = find_peaks(-y, prominence=prominence, wlen=wlen)
-    return len(peaks) + len(valleys)
-
-
-def count_turning_points_columns(arr, eps=1e-8, window_length=5, polyorder=2, smooth=False, prominence=None, wlen=None):
-    """
-    Counts the number of turning points for each column in a 2D numpy array.
-    
-    Parameters:
-        arr (numpy.ndarray): 2D array where each column contains a sequence of values
+    # Pairs
+    # Use itertools.combinations_with_replacement to get unique pairs (order doesn't matter)
+    for a, b in itertools.combinations_with_replacement(letters, 2):
+        vec = np.zeros(n, dtype=int)
+        vec[letter_indices[a]] += 1
+        vec[letter_indices[b]] += 1
         
-    Returns:
-        numpy.ndarray: Array containing the number of turning points for each column
-    """
-    arr = np.asarray(arr)
-    n_cols = arr.shape[1]
-    turning_points = np.zeros(n_cols)
+        # Create a canonical key. Since combinations_with_replacement produces
+        # sorted output, we can just join them.
+        key = f"{a}+{b}"
+        result[key] = vec
+        
+    return result
+
+
+def find_valid_partners(c_b, L, complexes_dict):
+    s1 = complexes_dict[c_b]
+    valid_partners = {}
+    for c in complexes_dict:
+        s_test = complexes_dict[c]
+        diff = s1 - s_test
+        # Check if this complex satisfies conservation laws
+        if all(np.dot(l_vec, diff) == 0 for l_vec in L):
+            valid_partners[c] = s_test
+    return valid_partners
+
+
+def generate_pairing_groups(L, complexes_dict):
+    pairing_groups = []
+    available_complexes = set(complexes_dict.keys())
+    while available_complexes:
+        c = available_complexes.pop()
+        valid_partners = find_valid_partners(c, L, complexes_dict)
+        # Ensure the group is self-contained and we only store it once
+        canonical_group = frozenset(valid_partners.keys())
+        is_new = True
+        for group in pairing_groups:
+            if canonical_group == frozenset(group.keys()):
+                is_new = False
+                break
+        if is_new:
+             pairing_groups.append(valid_partners)
+        
+    return pairing_groups
+
+
+def generate_initial_concentrations(L, base_concentrations=None, scale=4, offset_scale=3):
+    # Get nullspace basis vectors
+    nullspace = sympy.Matrix(L).nullspace()
     
-    for i in range(n_cols):
-        turning_points[i] = count_turning_points(arr[:, i], eps=eps, window_length=window_length, polyorder=polyorder, smooth=smooth, prominence=prominence, wlen=wlen)
-    return turning_points
+    # Create random offset from nullspace vectors
+    if nullspace:
+        offset = offset_scale * sum(np.random.random() * np.array(v, dtype=float) for v in nullspace)
+        offset = offset.flatten()
+    else:
+        offset = np.zeros(L.shape[1])
 
-def recompute_turning_points_list(ss_response_list, eps=1e-8, window_length=5, polyorder=2, smooth=False, prominence=None, wlen=None):
-    """
-    Given a list of steady-state response arrays, recompute the number of turning points for each entry.
-    Args:
-        ss_response_list (list of np.ndarray): Each entry is a 2D array (responses for one system).
-        eps (float): Threshold for numerical noise in turning point detection.
-    Returns:
-        list of np.ndarray: Each entry is the turning points array for the corresponding ss_response.
-    """
-    return [[count_turning_points_columns(ss_response, eps=eps, window_length=window_length, polyorder=polyorder, smooth=smooth, prominence=prominence, wlen=wlen) for ss_response in ss_responses] for ss_responses in ss_response_list]
-
-def compute_above_threshold(ss_response_list, threshold):
-    """
-    Given a list of steady-state response arrays, recompute the number of turning points for each entry.
-    Args:
-        ss_response_list (list of np.ndarray): Each entry is a 2D array (responses for one system).
-        eps (float): Threshold for numerical noise in turning point detection.
-    Returns:
-        list of np.ndarray: Each entry is the turning points array for the corresponding ss_response.
-    """
-    return [[np.mean(ss_response, axis=0) < threshold for ss_response in ss_responses] for ss_responses in ss_response_list]
-
-def reaction_network_to_bipartite_graph(reaction_network, n_species):
-    G = nx.DiGraph()
-    # Add species nodes
-    for i in range(n_species):
-        G.add_node(f"S{i+1}", bipartite='species')
-    # Add reaction nodes and edges
-    for idx, rxn in enumerate(reaction_network):
-        rxn_node = f"R{idx+1}"
-        G.add_node(rxn_node, bipartite='reaction')
-        # Reactants: edge from species to reaction
-        for sidx, stoich in rxn.reactants:
-            G.add_edge(f"S{sidx+1}", rxn_node, stoich=stoich, role='reactant')
-        # Products: edge from reaction to species
-        for sidx, stoich in rxn.products:
-            G.add_edge(rxn_node, f"S{sidx+1}", stoich=stoich, role='product')
-    return G
-
-
-def export_data_as_apkl(filename, L_list, S_list, k_list, y0_list, k_values_list, odes_list, reaction_network_list, ss_response_list, G_list):
-    """
-    Exports the provided data lists to a .apkl file using pickle.
+    # Create initial concentrations and add offset
+    if base_concentrations is None:
+        base_concentrations = np.ones(L.shape[1])
+    C = scale * base_concentrations
+    C = C + offset
     
-    Args:
-        filename (str): The path to the output .apkl file.
-        S_list, k_list, odes_list, reaction_network_list, turning_points_list, ss_response_list, G_list: Data to export.
-    """
-    data = {
-        'L_list': L_list,
-        'S_list': S_list,
-        'k_list': k_list,
-        'y0_list': y0_list,
-        'k_values_list': k_values_list,
-        'odes_list': odes_list,
-        'reaction_network_list': reaction_network_list,
-        'ss_response_list': ss_response_list,
-        'G_list': G_list
-    }
-    with open(filename, 'wb') as f:
-        pickle.dump(data, f)
-    print(f"Data exported to {filename}")
+    return C
 
-def import_data_from_apkl(filename):
-    """
-    Loads data from a .apkl file created by export_data_as_apkl.
-    
-    Args:
-        filename (str): The path to the .apkl file.
-    
-    Returns:
-        dict: Dictionary containing all the exported lists.
-    """
-    with open(filename, 'rb') as f:
-        data = pickle.load(f)
-    return data
+def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-8):
+    n_species = L.shape[1]
+    # Start from the NNLS solution as an initial guess
+    from scipy.optimize import nnls
+    C0, _ = nnls(L, const_vals)
+    C0 = np.maximum(C0, min_conc)
 
+    def variance(C):
+        return np.var(C)
 
-def draw_bipartite_reaction_network(G, pos=None, ax=None):
-    """
-    Draws a bipartite reaction network graph with custom node and edge colors/styles.
-    Args:
-        G (networkx.Graph): The bipartite reaction network graph.
-        pos (dict or None): Node positions. If None, uses spring_layout.
-        figsize (tuple): Figure size for the plot.
-    """
-    import matplotlib.pyplot as plt
-    import networkx as nx
+    constraints = [
+        {'type': 'eq', 'fun': lambda C: L @ C - const_vals},
+        {'type': 'ineq', 'fun': lambda C: C - min_conc}
+    ]
 
-    color_map = []
-    for node in G.nodes():
-        if node.startswith('S'):  # Species nodes
-            color_map.append('skyblue')
-        else:  # Reaction nodes
-            color_map.append('salmon')
-
-    edge_colors = []
-    edge_widths = []
-    edge_styles = []
-    for u, v in G.edges():
-        if u.startswith('S') and v.startswith('R'):
-            edge_colors.append('black')
-            edge_widths.append(1.75)
-            edge_styles.append('solid')
-        elif u.startswith('R') and v.startswith('S'):
-            edge_colors.append('green')
-            edge_widths.append(1.75)
-            edge_styles.append('dashed')
-
-    # If no ax is provided, create a new figure and axes
-    if ax is None:
-        fig, ax = plt.figure(figsize=(10, 6))
-
-    nx.draw(
-        G, pos,
-        with_labels=True,
-        node_color=color_map,
-        edge_color=edge_colors,
-        width=edge_widths,
-        style=edge_styles,
-        node_size=800,
-        arrows=True,
-        arrowsize=20, 
-        ax=ax
+    result = minimize(
+        variance,
+        C0,
+        constraints=constraints,
+        method='SLSQP',
+        options={'ftol': 1e-6, 'maxiter': 1000}
     )
-    if ax is None:
-        plt.show()
+
+    if not result.success:
+        raise RuntimeError("Optimization failed: " + result.message)
+    return result.x
+
+class ReactionNetwork:
+    """
+    Represents the structure and symbolic properties of a chemical reaction network.
+    Handles network construction, symbolic ODE generation, and conservation law management.
+    """
+    def __init__(self, n_complexes: int, n_reactions: int, n_lcs: int, n_species: int, L: np.ndarray, n_cons: int, seed: int, force_reverse: bool = True):
+        """
+        Constructs a ReactionNetwork instance. This is equivalent to the
+        old `build_reaction_network` function.
+        Ensures full reproducibility by using local RNGs for both numpy and Python random.
+        """
+        self.seed = seed
+        self.rng = np.random.default_rng(self.seed)
+        self.py_rng = random.Random(self.seed)
+        self.n_tries = 200
+
+        for n in range(self.n_tries):
+            try:
+                self.force_reverse = force_reverse
+                self.complexes_per_class, self.reactions_per_class = self._random_partition_complexes_and_reactions(
+                    n_complexes, n_reactions, n_lcs)
+                self.complexes_dict = generate_string_vector_dict(n_species)
+                self.pairing_groups = generate_pairing_groups(L, self.complexes_dict)
+                
+                self.linkage_groups = self._generate_linkage_class_graphs()
+                self.assignments = self._assign_complexes_to_linkage_groups()
+
+                self.species_names = list(string.ascii_uppercase[:n_species])
+                self.Y, self.all_complexes = self._build_Y_matrix()
+                self.reactions = self._build_reaction_list(random_rates=True)
+                self.A = self._build_A_matrix_incidence()
+                self.Psi = self._build_Psi_function()
+                self.L = L
+
+                # deficiency check is now inside the try block
+                rank_YA = np.linalg.matrix_rank(self.Y @ self.A)
+                if n_species - rank_YA == n_cons:
+                    # Success, break the loop
+                    break
+
+            except (ValueError, nx.NetworkXError):
+                # If any part of the setup fails, continue to the next try
+                continue
+        else:
+            # This 'else' block executes only if the 'for' loop completes without a 'break'.
+            # This means all 'n_tries' attempts failed.
+            raise ValueError(f"Could not find a valid reaction network with the specified parameters after {self.n_tries} attempts.")
+
+    def _random_partition_complexes_and_reactions(self, n_complexes, n_reactions, n_lcs):
+        min_complexes_per_class = 2
+        min_total_complexes = n_lcs * min_complexes_per_class
+        if n_complexes < min_total_complexes:
+            raise ValueError("Not enough complexes to give at least 2 to each class.")
+        
+        remaining_complexes = n_complexes - min_total_complexes
+        extra_complexes = self.rng.multinomial(remaining_complexes, [1/n_lcs]*n_lcs) if remaining_complexes > 0 else np.zeros(n_lcs, dtype=int)
+        complexes_per_class = min_complexes_per_class + extra_complexes
+
+        min_reactions_per_class = complexes_per_class - 1
+        if self.force_reverse:
+            max_reactions_per_class = (complexes_per_class * (complexes_per_class - 1) // 2).astype(int)
+        else:
+            max_reactions_per_class = (complexes_per_class * (complexes_per_class - 1)).astype(int)
+        
+        min_total_reactions = min_reactions_per_class.sum()
+        max_total_reactions = max_reactions_per_class.sum()
+        
+        if n_reactions < min_total_reactions:
+            print(f"Setting n_reactions to minimum value: {min_total_reactions}")
+            n_reactions = min_total_reactions
+        if n_reactions > max_total_reactions:
+            print(f"Setting n_reactions to maximum value: {max_total_reactions}")
+            n_reactions = max_total_reactions
+
+        remaining_reactions = n_reactions - min_total_reactions
+        reactions_per_class = min_reactions_per_class.copy()
+        
+        for _ in range(remaining_reactions):
+            eligible = np.where(reactions_per_class < max_reactions_per_class)[0]
+            if not eligible.any(): break
+            reactions_per_class[self.rng.choice(eligible)] += 1
+
+        return complexes_per_class, reactions_per_class
+
+    def _generate_linkage_class_graphs(self):
+        graphs = []
+        for n_nodes, n_edges in zip(self.complexes_per_class, self.reactions_per_class):
+            G = random_connected_graph(n_nodes, n_edges, self.rng, self.seed, directed=not self.force_reverse)
+            graphs.append(G)
+        return graphs
+
+    def _assign_complexes_to_linkage_groups(self):
+        pairing_groups_copy = self.pairing_groups[:]
+        used_complexes = set()
+        assignments = []
+
+        for G in self.linkage_groups:
+            n_nodes = G.number_of_nodes()
+            found = False
+            self.py_rng.shuffle(pairing_groups_copy)
+            for pairing_group in pairing_groups_copy:
+                available_complexes = [c for c in pairing_group if c not in used_complexes]
+                if len(available_complexes) >= n_nodes:
+                    chosen_complexes = self.py_rng.sample(available_complexes, n_nodes)
+                    node_assignment = {node: complex_name for node, complex_name in zip(G.nodes(), chosen_complexes)}
+                    assignments.append(node_assignment)
+                    used_complexes.update(chosen_complexes)
+                    found = True
+                    break
+            if not found:
+                raise ValueError(f"Not enough complexes for linkage group with {n_nodes} nodes.")
+
+        for G, node_assignment in zip(self.linkage_groups, assignments):
+            nx.relabel_nodes(G, node_assignment, copy=False)
+        return assignments
+
+    def _build_Y_matrix(self):
+        all_complexes = []
+        for group in self.assignments:
+            all_complexes.extend(sorted(group.values()))
+        all_complexes = list(dict.fromkeys(all_complexes))
+        
+        Y = np.zeros((len(self.species_names), len(all_complexes)), dtype=int)
+        for j, cname in enumerate(all_complexes):
+            Y[:, j] = self.complexes_dict[cname]
+        return Y, all_complexes
+
+    def _build_reaction_list(self, random_rates=True):
+        complex_to_idx = {c: i for i, c in enumerate(self.all_complexes)}
+        reactions = []
+        for G in self.linkage_groups:
+            for u, v in G.edges():
+                # Add the forward reaction
+                forward_rate = self.rng.uniform(0.1, 2.0) if random_rates else 1.0
+                reactions.append((complex_to_idx[u], complex_to_idx[v], forward_rate))
+                
+                # If reversible, add the backward reaction with its own rate
+                if self.force_reverse:
+                    backward_rate = self.rng.uniform(0.1, 2.0) if random_rates else 1.0
+                    reactions.append((complex_to_idx[v], complex_to_idx[u], backward_rate))
+        return reactions
+        
+    def _build_A_matrix_incidence(self):
+        n = len(self.all_complexes)
+        A = np.zeros((n, n))
+        for i, j, k in self.reactions:
+            A[j, i] += k
+            A[i, i] -= k
+        return A
+
+    def _build_Psi_function(self):
+        def Psi(C):
+            vals = []
+            for i, j, k in self.reactions:
+                monomial = np.prod(C ** self.Y[:, i])
+                vals.append(monomial)
+            return np.array(vals)
+        return Psi
+
+    def update_rates(self, new_rates: List[float]):
+        """
+        Updates the reaction rate constants in place.
+        `new_rates` should be a list of floats of the same length as the
+        number of reactions.
+        """
+        if len(new_rates) != len(self.reactions):
+            raise ValueError(f"Expected {len(self.reactions)} rates, but got {len(new_rates)}.")
+
+        self.reactions = [(i, j, new_rate) for (i, j, _), new_rate in zip(self.reactions, new_rates)]
+        self.A = self._build_A_matrix_incidence()
+
+    
+    
+
+class ReactionNetworkSimulator:
+    """
+    Handles numeric simulation and integration of a ReactionNetwork, including ODE reduction via conservation laws.
+    """
+    def __init__(self, reaction_network: ReactionNetwork):
+        """
+        Args:
+            reaction_network: An instance of ReactionNetwork
+        """
+        self.r_n = reaction_network
+        self.rhs = self._make_ode_rhs()
+        self.reduced_ode_rhs = None
+        self.remaining_species = None
+        self.const_syms = None
+        self.elimination_solutions = None
+
+    def _make_ode_rhs(self):
+        def rhs(C):
+            v_monomials = self.r_n.Psi(C)
+            dCdt = np.zeros(self.r_n.Y.shape[0])
+            for idx, (i, j, k) in enumerate(self.r_n.reactions):
+                rate = k * v_monomials[idx]
+                stoichiometric_change = self.r_n.Y[:, j] - self.r_n.Y[:, i]
+                dCdt += rate * stoichiometric_change
+            return dCdt
+        return rhs
+
+    def integrate(
+        self,
+        ode_rhs,
+        initial_conditions: np.ndarray,
+        t_span: Tuple[float, float] = (0, 5),
+        num_points: int = 20000,
+        **kwargs
+        ) -> Tuple[object, np.ndarray]:
+        """
+        Integrate an ODE system using the provided right-hand side function.
+
+        Args:
+            ode_rhs: Callable (t, y) -> dy/dt (the ODE right-hand side)
+            initial_conditions: Initial concentrations (array)
+            t_span: Tuple (start, end) for integration time
+            t_eval: Array of time points to evaluate at (optional)
+            kwargs: Additional arguments to pass to solve_ivp
+
+        Returns:
+            sol: The solution object from solve_ivp
+            final_concentrations: Concentrations at the final time point
+        """
+        t_eval = np.linspace(t_span[0], t_span[1], num_points)
+        sol = solve_ivp(lambda t, C: ode_rhs(C), t_span, initial_conditions, t_eval=t_eval, **kwargs)
+        return sol, sol.y[:,-1]
+
+    def solve_conservation_laws(self):
+        """
+        Symbolically solves the conservation laws for the eliminated variables.
+        """
+        _, all_species_syms, _ = self.get_symbolic_rhs()  # Use sympy symbols, not string names
+        species_names = [str(s) for s in all_species_syms]
+        species_map = {str(s): s for s in all_species_syms}
+        const_syms = [sympy.symbols(f'const{i}') for i in range(len(self.r_n.L))]
+        conservation_eqns = []
+        eliminated_species = []
+        for i, conservation_vector in enumerate(self.r_n.L):
+            nonzero_indices = np.nonzero(conservation_vector)[0]
+            species_indices = [(idx, str(all_species_syms[idx])) for idx in nonzero_indices]
+            species_indices.sort(key=lambda x: x[1])
+            if not species_indices:
+                continue
+            elim_idx, elim_species = next((idx, species) for idx, species in species_indices if species not in eliminated_species)
+            eliminated_species.append(elim_species)
+            # Use sympy sum for symbolic computation
+            eqn = sum(conservation_vector[j] * all_species_syms[j] for j in range(len(all_species_syms))) - const_syms[i]
+            conservation_eqns.append(eqn)
+        elim_syms = [species_map[s] for s in eliminated_species]
+        solutions_list = sympy.solve(conservation_eqns, elim_syms, dict=True)
+        if not solutions_list:
+            raise RuntimeError("Could not solve conservation laws for eliminated species.")
+        solutions = solutions_list[0]  # dict: sympy.Symbol -> expression
+        elimination_solutions = {str(k): v for k, v in solutions.items()}
+        remaining_species = [s for s in species_names if s not in eliminated_species]
+        self.eliminated_species = eliminated_species
+        self.remaining_species = remaining_species
+        self.const_syms = const_syms
+        self.elimination_solutions = elimination_solutions
+
+    def make_reduced_rhs_with_conservation(self, const_vals, rate_vals=None):
+        """
+        Constructs a reduced ODE rhs function with conservation laws substituted in.
+        Args:
+            const_vals: values for the conservation constants (list or array)
+            rate_vals: values for the rate constants (optional, defaults to r_n.rate_constants or [r[2] for r in r_n.reactions])
+        Returns:
+            ode_rhs(C): function of concentrations for the remaining species
+        """
+        
+        dCdt_sym, all_species_syms, rate_syms = self.get_symbolic_rhs()
+        species_names = [str(s) for s in all_species_syms]
+        species_map = {str(s): s for s in all_species_syms}
+        remaining_syms = [species_map[s] for s in self.remaining_species]
+        # Substitute solutions into the ODEs
+        solutions = {species_map[k]: v for k, v in self.elimination_solutions.items()}
+        substituted_rhs = [expr.subs(solutions, simultaneous=True) for expr in dCdt_sym]
+        rhs_kept = [substituted_rhs[species_names.index(s)] for s in self.remaining_species]
+        func_args = remaining_syms + self.const_syms + list(rate_syms)
+        rhs_func = sympy.lambdify(func_args, rhs_kept, modules=['numpy'])
+        rate_vals = [r[2] for r in self.r_n.reactions]
+        def reduced_ode_rhs(C):
+            args = list(C) + list(const_vals) + list(rate_vals)
+            return np.array(rhs_func(*args)).flatten()
+        # Optionally store for later use
+        self.reduced_ode_rhs = reduced_ode_rhs
+
+    def get_const_and_reduced_init(self, C):
+
+        # Compute the values of the conservation constants from the initial conditions
+        const_vals = np.dot(self.r_n.L, C)
+
+        # Get the indices of the remaining species
+        idx_remain = [self.r_n.species_names.index(s) for s in self.remaining_species]
+        reduced_init = C[idx_remain]
+
+        return const_vals, reduced_init
+    
+    def recover_eliminated_species(self, const_vals, C_reduced):
+        # Build the substitution dictionary for sympy
+        subs = dict(zip(self.remaining_species, C_reduced))
+        subs.update(zip(self.const_syms, const_vals))
+
+        # Recursively substitute eliminated species
+        recovered = {}
+        for elim_name, expr in self.elimination_solutions.items():
+            expr_sub = expr
+            # Substitute other eliminated species if present
+            for other_name, other_expr in self.elimination_solutions.items():
+                if other_name != elim_name:
+                    expr_sub = expr_sub.subs(other_name, other_expr)
+            # Now substitute numeric values
+            val = expr_sub.evalf(subs=subs)
+            try:
+                recovered[elim_name] = float(val)
+            except TypeError:
+                recovered[elim_name] = val  # fallback: return symbolic if not numeric
+
+        # Build complete concentration vector with all species
+        C_complete = np.zeros(len(self.r_n.species_names))
+        
+        # Fill in the remaining species values
+        for species, value in zip(self.remaining_species, C_reduced):
+            idx = self.r_n.species_names.index(species)
+            C_complete[idx] = value
+            
+        # Fill in the recovered eliminated species values
+        for species, value in recovered.items():
+            idx = self.r_n.species_names.index(str(species))
+            C_complete[idx] = value
+
+        return C_complete
+
+    def get_symbolic_rhs(self) -> Tuple[List[sympy.Expr], List[sympy.Symbol], List[sympy.Symbol]]:
+        """
+        Returns the symbolic right-hand side of the ODEs for the reaction network.
+        Returns:
+            dCdt_sym: List of sympy expressions for dC/dt for each species
+            species_syms: List of sympy symbols for each species
+            rate_syms: List of sympy symbols for each rate constant
+        """
+
+        # Create symbolic variables for each species
+        species_syms = sympy.symbols(self.r_n.species_names)
+        
+        # Create descriptive names for the symbolic rate constants
+        rate_names = []
+        for r_idx, (i, j, _) in enumerate(self.r_n.reactions):
+            # Creates names like: k_0_C+C_B+C
+            # reactant_str = self.r_n.all_complexes[i]
+            # product_str = self.r_n.all_complexes[j]
+            # rate_names.append(f'k_{r_idx};{reactant_str}->{product_str}')
+            rate_names.append(f'k_{r_idx}')
+
+        rate_syms = sympy.symbols(rate_names)
+
+        # Initialize a list to hold the symbolic ODE for each species
+        dCdt_sym = [sympy.Integer(0)] * len(species_syms)
+
+        # Iterate through each reaction to build the symbolic ODEs
+        for idx, (i, j, k_val) in enumerate(self.r_n.reactions):
+            rate_k = rate_syms[idx]
+            
+            # Build the monomial for the reactant complex
+            reactant_complex_stoich = self.r_n.Y[:, i]
+            monomial = sympy.Integer(1)
+            for species_idx, exponent in enumerate(reactant_complex_stoich):
+                if exponent > 0:
+                    monomial *= species_syms[species_idx]**exponent
+            
+            # Symbolic representation of the reaction rate
+            reaction_rate_sym = rate_k * monomial
+            
+            # Stoichiometric change vector for the reaction
+            stoich_change = self.r_n.Y[:, j] - self.r_n.Y[:, i]
+            
+            # Add this reaction's contribution to each species' ODE
+            for species_idx, change in enumerate(stoich_change):
+                if change != 0:
+                    dCdt_sym[species_idx] += change * reaction_rate_sym
+                
+        return dCdt_sym, species_syms, rate_syms
+    
+    def get_symbolic_reduced_rhs(self):
+        """
+        Returns the symbolic right-hand side of the reduced ODEs (after eliminating variables using conservation laws).
+        Returns:
+            reduced_rhs: List of sympy expressions for dC/dt for each remaining species
+            remaining_syms: List of sympy symbols for the remaining species
+            const_syms: List of sympy symbols for the conservation constants
+            rate_syms: List of sympy symbols for each rate constant
+        """
+        # Ensure conservation laws have been solved
+        if self.elimination_solutions is None or self.remaining_species is None:
+            self.solve_conservation_laws()
+
+        # Get the full symbolic ODEs
+        dCdt_sym, all_species_syms, rate_syms = self.get_symbolic_rhs()
+        species_names = [str(s) for s in all_species_syms]
+        species_map = {str(s): s for s in all_species_syms}
+        remaining_syms = [species_map[s] for s in self.remaining_species]
+
+        # Substitute eliminated species in the ODEs
+        solutions = {species_map[k]: v for k, v in self.elimination_solutions.items()}
+        substituted_rhs = [expr.subs(solutions, simultaneous=True) for expr in dCdt_sym]
+
+        # Only keep the ODEs for the remaining species
+        reduced_rhs = [substituted_rhs[species_names.index(s)] for s in self.remaining_species]
+
+        return reduced_rhs, remaining_syms, self.const_syms, rate_syms
+    
+    def get_derivatives(self):
+        """
+        Returns symbolic and lambdified derivatives of the reduced ODE system with respect to remaining species, conservation constants, and rate constants.
+        
+        Tensor and function naming/indexing convention:
+            dX_dY_dZ[i, j, k] = ∂²X_i / ∂Y_j ∂Z_k
+        where X is the numerator (e.g., R), Y and Z are the denominator variables (e.g., C, l, k), and indices follow this order.
+        All lambdified functions return arrays with the same indexing convention.
+        
+        Returns:
+            dR_dC, dR_dC_func: Jacobian w.r.t. remaining species
+            dR_dl, dR_dl_func: Jacobian w.r.t. conservation constants
+            dR_dC_dk, dR_dC_dk_func: 2nd derivative w.r.t. species and rate constants
+            dR_dl_dk, dR_dl_dk_func: 2nd derivative w.r.t. conservation constants and rate constants
+            dR_dC_dl, dR_dC_dl_func: 2nd derivative w.r.t. species and conservation constants
+            dR_dl_dl, dR_dl_dl_func: 2nd derivative w.r.t. conservation constants (twice)
+            remaining_syms: list of sympy symbols for the remaining species
+        """
+        reduced_rhs, remaining_syms, const_syms, rate_syms = self.get_symbolic_reduced_rhs()
+        arg_syms = list(remaining_syms) + list(const_syms) + list(rate_syms)
+        dR_dC = sympy.Matrix(reduced_rhs).jacobian(remaining_syms)
+        dR_dC_func = sympy.lambdify(
+            arg_syms,
+            dR_dC,
+            modules='numpy'
+        )
+
+        dR_dl = sympy.Matrix(reduced_rhs).jacobian(const_syms)
+        dR_dl_func = sympy.lambdify(
+            arg_syms,
+            dR_dl,
+            modules='numpy'
+        )
+
+        dR_dk = sympy.Matrix(reduced_rhs).jacobian(rate_syms)
+        dR_dk_func = sympy.lambdify(
+            arg_syms,
+            dR_dk,
+            modules='numpy'
+        )
+
+        # dR_dC_dk: (m, n, p)
+        m, n = dR_dC.shape
+        p = len(rate_syms)
+        dR_dC_dk = sympy.MutableDenseNDimArray(
+            [[[dR_dC[i, j].diff(rate_syms[k]) for k in range(p)] for j in range(n)] for i in range(m)]
+        )
+        # Lambdify each entry individually, then wrap in a function that evaluates the whole tensor
+        def evaluate_tensor_func(func_array, *args):
+            out = np.empty(func_array.shape, dtype=float)
+            it = np.nditer(func_array, flags=['multi_index', 'refs_ok'])
+            for x in it:
+                idx = it.multi_index
+                out[idx] = func_array[idx](*args)
+            return out
+
+        dR_dC_dk_func_array = np.empty((m, n, p), dtype=object)
+        
+        for i in range(m):
+            for j in range(n):
+                for k in range(p):
+                    dR_dC_dk_func_array[i, j, k] = sympy.lambdify(arg_syms, dR_dC_dk[i, j, k], modules='numpy')
+        def dR_dC_dk_func(*args):
+            return evaluate_tensor_func(dR_dC_dk_func_array, *args)
+
+        m_dl, n_dl = dR_dl.shape
+        dR_dl_dk = sympy.MutableDenseNDimArray(
+            [[[dR_dl[i, j].diff(rate_syms[k]) for k in range(p)] for j in range(n_dl)] for i in range(m_dl)]
+        )
+        dR_dl_dk_func_array = np.empty((m_dl, n_dl, p), dtype=object)
+        for i in range(m_dl):
+            for j in range(n_dl):
+                for k in range(p):
+                    dR_dl_dk_func_array[i, j, k] = sympy.lambdify(arg_syms, dR_dl_dk[i, j, k], modules='numpy')
+        def dR_dl_dk_func(*args):
+            return evaluate_tensor_func(dR_dl_dk_func_array, *args)
+        
+        # n_dl = len(const_syms)
+        # dR_dC_dl = sympy.MutableDenseNDimArray(
+        #     [[[dR_dC[i, j].diff(const_syms[k]) for k in range(n_dl)] for j in range(n)] for i in range(m)]
+        # )
+        # dR_dC_dl_func_array = np.empty((m, n, n_dl), dtype=object)
+        # for i in range(m):
+        #     for j in range(n):
+        #         for k in range(n_dl):
+        #             dR_dC_dl_func_array[i, j, k] = sympy.lambdify(arg_syms, dR_dC_dl[i, j, k], modules='numpy')
+        # def dR_dC_dl_func(*args):
+        #     return evaluate_tensor_func(dR_dC_dl_func_array, *args)
+        
+        # # dR_dl_dl: (m_dl, n_dl, n_dl)
+        # dR_dl_dl = sympy.MutableDenseNDimArray(
+        #     [[[dR_dl[i, j].diff(const_syms[k]) for k in range(n_dl)] for j in range(n_dl)] for i in range(m_dl)]
+        # )
+        # dR_dl_dl_func_array = np.empty((m_dl, n_dl, n_dl), dtype=object)
+        # for i in range(m_dl):
+        #     for j in range(n_dl):
+        #         for k in range(n_dl):
+        #             dR_dl_dl_func_array[i, j, k] = sympy.lambdify(arg_syms, dR_dl_dl[i, j, k], modules='numpy')
+        # def dR_dl_dl_func(*args):
+        #     return evaluate_tensor_func(dR_dl_dl_func_array, *args)
+
+
+        return (
+            dR_dC, dR_dC_func,
+            dR_dl, dR_dl_func,
+            dR_dk, dR_dk_func,
+            dR_dC_dk, dR_dC_dk_func,
+            dR_dl_dk, dR_dl_dk_func,
+            #dR_dC_dl, dR_dC_dl_func,
+            #dR_dl_dl, dR_dl_dl_func,
+            remaining_syms
+        )
+
+    def dC_dl_func(self, C, const_vals, rates, dR_dC_func, dR_dl_func):
+        args = list(C) + list(const_vals) + list(rates)
+        dR_dC_eval = dR_dC_func(*args) 
+        dR_dl_eval = dR_dl_func(*args)
+        dC_dl = -np.tensordot(np.linalg.inv(dR_dC_eval), dR_dl_eval, axes = ([1], [0]))
+        return dC_dl
+    
+    def dC_dk_func(self, C, const_vals, rates, dR_dC_func, dR_dk_func):
+        args = list(C) + list(const_vals) + list(rates)
+        dR_dC_eval = dR_dC_func(*args) 
+        dR_dk_eval = dR_dk_func(*args)
+        dC_dk = -np.tensordot(np.linalg.inv(dR_dC_eval), dR_dk_eval, axes = ([1], [0]))
+        return dC_dk
+
+    def dC_dl_laplacian_func(self, C, const_vals, rates, dR_dC_func, dR_dl_func, dR_dl_dl_func, dR_dC_dl_func):
+        args = list(C) + list(const_vals) + list(rates)
+        dR_dC_eval = dR_dC_func(*args) 
+        dR_dl_eval = dR_dl_func(*args)
+        dR_dl_dl_eval = dR_dl_dl_func(*args)
+        dR_dC_dl_eval = dR_dC_dl_func(*args)
+
+        M = np.linalg.inv(dR_dC_eval)
+        Q = - np.tensordot(np.tensordot(M, dR_dC_dl_eval, axes = ([1], [0])), M, axes = ([1], [0])).swapaxes(-1,-2) # dM_{ij} / dl_k
+
+        term_1 = - np.einsum('ijj->i', np.tensordot(Q, dR_dl_eval, axes = ([1], [0])))
+        dR_dl_dl_contr = np.einsum('ijj->i', dR_dl_dl_eval)
+        term_2 = - np.tensordot(M, dR_dl_dl_contr, axes = ([1], [0]))
+
+        return term_1 + term_2
+
+    def dC_func(self, t, C, rates, l_unit_vec, l_base, dR_dC_func, dR_dl_func):
+        const_vals = l_unit_vec * t + l_base
+        dC_dl = self.dC_dl_func(C, const_vals, rates, dR_dC_func, dR_dl_func)
+        dC = np.tensordot(dC_dl, l_unit_vec, axes = ([1], [0]))
+        return dC
+    
+    def dC_dl_dk_func(self, t, C, rates, l_unit_vec, l_base, dR_dC_func, dR_dl_func, dR_dC_dk_func, dR_dl_dk_func):
+        const_vals = l_unit_vec * t + l_base
+        args = list(C) + list(const_vals) + list(rates)
+
+        dR_dC_eval = dR_dC_func(*args)
+        M = np.linalg.inv(dR_dC_eval)
+        dR_dl_eval = dR_dl_func(*args)
+        dR_dC_dk_eval = dR_dC_dk_func(*args)
+        dR_dl_dk_eval = dR_dl_dk_func(*args)
+
+        term_1 = np.tensordot(
+            np.tensordot(
+                np.tensordot(
+                    M, dR_dC_dk_eval, axes = ([1], [0])), 
+                M, axes = ([1], [0])),
+            dR_dl_eval, axes = ([2], [0])).swapaxes(-2,-1)
+
+        term_2 = -np.tensordot(M, dR_dl_dk_eval, axes = ([1], [0]))
+
+        dC_dl_dk = term_1 + term_2
+        return dC_dl_dk
+    
+    def dC_and_dC_dk_combined_func(self, t, C_combined, rates, l_unit_vec, l_base, dR_dC_func, dR_dl_func, dR_dC_dk_func, dR_dl_dk_func):
+        dC = self.dC_func(t, C_combined[:len(self.remaining_species)], rates, l_unit_vec, l_base, dR_dC_func, dR_dl_func)
+        dC_dk = np.tensordot(self.dC_dl_dk_func(t, C_combined[:len(self.remaining_species)], rates, l_unit_vec, l_base, dR_dC_func, dR_dl_func, dR_dC_dk_func, dR_dl_dk_func), l_unit_vec, axes = ([1], [0]))
+        dC_combined = np.concatenate([dC, dC_dk.flatten()], axis = 0)
+        return dC_combined
+    
+    def convert_dC_combined(self, dC_combined):
+        dC = dC_combined[:len(self.remaining_species)]
+        dC_dk = dC_combined[len(self.remaining_species):].reshape(len(self.remaining_species), -1)
+        return dC, dC_dk
+    
+    def compute_dC_dk_full(self, dC_dk):
+        """
+        Computes the full dC_dk matrix including both eliminated and remaining species.
+        
+        Args:
+            sim: Simulation object containing elimination solutions and remaining species
+            dC_dk: Matrix of derivatives for remaining species
+        
+        Returns:
+            numpy array: Full dC_dk matrix for all species
+        """
+        dsp_dk_list = []
+        for sp, expr in self.elimination_solutions.items():
+            dsp_dk = np.zeros_like(dC_dk[0])
+            for (i, rem_sp) in enumerate(self.remaining_species):
+                coef = float(expr.coeff(sympy.Symbol(rem_sp)))
+                dsp_dk = dsp_dk + dC_dk[i] * coef
+            dsp_dk_list.append(dsp_dk)
+
+        # Create new dC_dk list with interleaved values
+        new_dC_dk = []
+        eliminated_species = list(self.elimination_solutions.keys())
+        all_species = eliminated_species + self.remaining_species
+
+        for sp in self.r_n.species_names:
+            if sp in eliminated_species:
+                # Get index in eliminated species list to find corresponding dsp_dk
+                idx = eliminated_species.index(sp)
+                new_dC_dk.append(dsp_dk_list[idx])
+            else:
+                # Get index in remaining species list to find corresponding dC_dk
+                idx = self.remaining_species.index(sp)
+                new_dC_dk.append(dC_dk[idx])
+
+        return np.array(new_dC_dk)
+
+    # --- JAX-based autodiff ODE integration and sensitivity ---
+    def jax_rhs(self, C, rates):
+        """
+        JAX-compatible ODE right-hand side for the full system.
+        C: jnp.array, concentrations
+        rates: jnp.array, rate constants
+        Returns: dC/dt as jnp.array
+        """
+
+        # Re-implement the ODE system using JAX operations only
+        # This is a direct translation of self.r_n.Psi and self.r_n.reactions logic
+        Y = jnp.array(self.r_n.Y)
+        reactions = self.r_n.reactions
+        n_species = Y.shape[0]
+        v_monomials = []
+        for idx, (i, j, _) in enumerate(reactions):
+            monomial = jnp.prod(C ** Y[:, i])
+            v_monomials.append(monomial)
+        v_monomials = jnp.array(v_monomials)
+        dCdt = jnp.zeros(n_species)
+        for idx, (i, j, _) in enumerate(reactions):
+            rate = rates[idx] * v_monomials[idx]
+            stoich_change = Y[:, j] - Y[:, i]
+            dCdt = dCdt + rate * stoich_change
+        return dCdt
+
+    def integrate_final_conc_jax(self, C0, rates, t0=0.0, t1=1000.0, dt0=1e-2, max_steps=100000):
+        """
+        Integrate the ODE using diffrax and return the final concentrations.
+        C0: initial concentrations (jnp.array)
+        rates: rate constants (jnp.array)
+        Returns: final concentrations (jnp.array)
+        """
+ 
+        def ode_func(t, C, args):
+            rates = args
+            return self.jax_rhs(C, rates)
+        term = ODETerm(ode_func)
+        sol = diffeqsolve(
+            term,
+            solver=Dopri5(),
+            t0=t0,
+            t1=t1,
+            dt0=dt0,
+            y0=C0,
+            args=rates,
+            saveat=SaveAt(t1=True),
+            max_steps=max_steps  # or higher if needed
+        )
+        return sol.ys[-1]
+
+    def sensitivity_wrt_rates_jax(self, C0, rates, t0=0.0, t1=1000.0, dt0=1e-2, max_steps=100000, mode='fwd'):
+        """
+        Compute the Jacobian of the final concentrations with respect to the rates using JAX autodiff.
+        C0: initial concentrations (jnp.array)
+        rates: rate constants (jnp.array)
+        Returns: Jacobian (n_species, n_rates)
+        """
+        import jax
+        if mode == 'fwd':
+            jac_fn = jax.jacfwd(lambda r: self.integrate_final_conc_jax(C0, r, t0, t1, dt0, max_steps))
+        else:
+            jac_fn = jax.jacrev(lambda r: self.integrate_final_conc_jax(C0, r, t0, t1, dt0, max_steps))
+        return jac_fn(rates)
+
+
+def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-8):
+    n_species = L.shape[1]
+    # Start from the NNLS solution as an initial guess
+    from scipy.optimize import nnls
+    C0, _ = nnls(L, const_vals)
+    C0 = np.maximum(C0, min_conc)
+
+    def variance(C):
+        return np.var(C)
+
+    constraints = [
+        {'type': 'eq', 'fun': lambda C: L @ C - const_vals},
+        {'type': 'ineq', 'fun': lambda C: C - min_conc}
+    ]
+
+    result = minimize(
+        variance,
+        C0,
+        constraints=constraints,
+        method='SLSQP',
+        options={'ftol': 1e-6, 'maxiter': 5000}
+    )
+
+    if not result.success:
+        raise RuntimeError("Optimization failed: " + result.message)
+    return result.x
+
+def compute_probs(C_full, L_vec, l0):
+    return (L_vec[:, np.newaxis] * C_full / l0) if C_full.ndim == 2 else (L_vec * C_full / l0)
+
+class InputData:
+    """
+    Manages labeled input data for training and testing.
+    """
+
+    def __init__(self, n_classes, data_list, split_fac=0.75):
+        """
+        Initializes training and testing datasets.
+
+        Parameters:
+        - n_classes: Number of output classes
+        - data_list: List of data samples per class
+        - split_fac: Fraction of data used for training
+        """
+        self.n_classes = n_classes
+        self.labels = self._create_labels()
+        self.data_list = data_list 
+        self.split_fac = split_fac
+        self.training_data, self.testing_data = self._split_shuffle_data(data_list, split_fac)
+
+    def _create_labels(self):
+        """Creates one-hot encoded labels for classification."""
+        return [np.eye(self.n_classes)[n] for n in range(self.n_classes)]
+
+    def _split_shuffle_data(self, data_list, split_fac):
+        """Splits data into training and testing sets."""
+        tr_data, te_data = [], []
+        for nc in range(self.n_classes):
+            sub_data = data_list[nc]
+            random.shuffle(sub_data)
+            n_train = round(split_fac * len(sub_data))
+            tr_data.append(iter(sub_data[:n_train]))
+            te_data.append(iter(sub_data[n_train:]))
+        return tr_data, te_data
+
+    def refill_iterators(self):
+        """Refills the training and testing iterators from data_list."""
+        self.training_data, self.testing_data = self._split_shuffle_data(self.data_list, self.split_fac)
+
+    def get_next_training_sample(self, class_number):
+        """Returns the next training sample for the given class, refilling iterators as needed."""
+        try:
+            return next(self.training_data[class_number])
+        except StopIteration:
+            self.refill_iterators()
+            return next(self.training_data[class_number])
+        
