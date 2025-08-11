@@ -22,208 +22,98 @@ import jax
 import jax.numpy as jnp
 from diffrax import diffeqsolve, ODETerm, Dopri5, SaveAt
 
-
-def random_connected_graph(n_nodes, n_edges, rng, seed, directed=False):
-    """
-    Generate a random connected graph with n_nodes and n_edges.
-    Uses local numpy and Python RNGs for full reproducibility.
-    Args:
-        n_nodes: Number of nodes
-        n_edges: Number of edges
-        directed: Whether the graph is directed
-        rng: numpy.random.Generator
-        py_rng: random.Random
-    Returns:
-        G: networkx Graph or DiGraph
-    """
-
-    nodes = list(range(n_nodes))
-    if directed:
-        G = nx.DiGraph()
-        G.add_nodes_from(nodes)
-        # Generate a random tree and orient edges randomly
-        tree = nx.random_tree(n_nodes, seed=seed)
-        for u, v in tree.edges():
-            if rng.random() < 0.5:
-                G.add_edge(u, v)
-            else:
-                G.add_edge(v, u)
-        # Add extra edges
-        possible_edges = [(i, j) for i in nodes for j in nodes if i != j and not G.has_edge(i, j)]
-        extra_edges_needed = n_edges - (n_nodes - 1)
-        if extra_edges_needed > 0:
-            extra_edges_indices = rng.choice(len(possible_edges), size=extra_edges_needed, replace=False)
-            for idx in extra_edges_indices:
-                u, v = possible_edges[idx]
-                G.add_edge(u, v)
-    else:
-        G = nx.random_tree(n_nodes, seed=seed)
-        # Add extra edges
-        possible_edges = [(i, j) for i in nodes for j in nodes if i < j and not G.has_edge(i, j)]
-        extra_edges_needed = n_edges - (n_nodes - 1)
-        if extra_edges_needed > 0:
-            extra_edges_indices = rng.choice(len(possible_edges), size=extra_edges_needed, replace=False)
-            for idx in extra_edges_indices:
-                u, v = possible_edges[idx]
-                G.add_edge(u, v)
-    return G
-
-
-def random_conservation_laws(n_cons, n_species, probs):
-    L = []
-    mc = len(probs)
-    for _ in range(n_cons):
-        not_all_zero = True
-        while not_all_zero:
-            values = np.arange(mc)  
-            row = np.random.choice(values, size=n_species, p=probs).tolist()
-            if sum(row) != 0:  # Exclude all-zero row
-                not_all_zero = False
-        L.append(row)
-    return np.array(L)
-
-
-def generate_string_vector_dict(n):
-    """
-    Generates a dictionary mapping complex names (as strings) to their
-    vector representations. Correctly handles complexes like "A+E" and "E+A"
-    as identical by creating a canonical (sorted) representation.
-    """
-    letters = list(string.ascii_uppercase[:n])
-    letter_indices = {letter: i for i, letter in enumerate(letters)}
-    result = {}
-
-    # Single letters
-    for letter in letters:
-        vec = np.zeros(n, dtype=int)
-        vec[letter_indices[letter]] = 1
-        result[letter] = vec
-
-    # Pairs
-    # Use itertools.combinations_with_replacement to get unique pairs (order doesn't matter)
-    for a, b in itertools.combinations_with_replacement(letters, 2):
-        vec = np.zeros(n, dtype=int)
-        vec[letter_indices[a]] += 1
-        vec[letter_indices[b]] += 1
-        
-        # Create a canonical key. Since combinations_with_replacement produces
-        # sorted output, we can just join them.
-        key = f"{a}+{b}"
-        result[key] = vec
-        
-    return result
-
-
-def find_valid_partners(c_b, L, complexes_dict):
-    s1 = complexes_dict[c_b]
-    valid_partners = {}
-    for c in complexes_dict:
-        s_test = complexes_dict[c]
-        diff = s1 - s_test
-        # Check if this complex satisfies conservation laws
-        if all(np.dot(l_vec, diff) == 0 for l_vec in L):
-            valid_partners[c] = s_test
-    return valid_partners
-
-
-def generate_pairing_groups(L, complexes_dict):
-    pairing_groups = []
-    available_complexes = set(complexes_dict.keys())
-    while available_complexes:
-        c = available_complexes.pop()
-        valid_partners = find_valid_partners(c, L, complexes_dict)
-        # Ensure the group is self-contained and we only store it once
-        canonical_group = frozenset(valid_partners.keys())
-        is_new = True
-        for group in pairing_groups:
-            if canonical_group == frozenset(group.keys()):
-                is_new = False
-                break
-        if is_new:
-             pairing_groups.append(valid_partners)
-        
-    return pairing_groups
-
-
-def generate_initial_concentrations(L, base_concentrations=None, scale=4, offset_scale=3):
-    # Get nullspace basis vectors
-    nullspace = sympy.Matrix(L).nullspace()
-    
-    # Create random offset from nullspace vectors
-    if nullspace:
-        offset = offset_scale * sum(np.random.random() * np.array(v, dtype=float) for v in nullspace)
-        offset = offset.flatten()
-    else:
-        offset = np.zeros(L.shape[1])
-
-    # Create initial concentrations and add offset
-    if base_concentrations is None:
-        base_concentrations = np.ones(L.shape[1])
-    C = scale * base_concentrations
-    C = C + offset
-    
-    return C
-
-def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-8):
-    n_species = L.shape[1]
-    # Start from the NNLS solution as an initial guess
-    from scipy.optimize import nnls
-    C0, _ = nnls(L, const_vals)
-    C0 = np.maximum(C0, min_conc)
-
-    def variance(C):
-        return np.var(C)
-
-    constraints = [
-        {'type': 'eq', 'fun': lambda C: L @ C - const_vals},
-        {'type': 'ineq', 'fun': lambda C: C - min_conc}
-    ]
-
-    result = minimize(
-        variance,
-        C0,
-        constraints=constraints,
-        method='SLSQP',
-        options={'ftol': 1e-6, 'maxiter': 1000}
-    )
-
-    if not result.success:
-        raise RuntimeError("Optimization failed: " + result.message)
-    return result.x
+###################################################################
+######################## Class Definitions ########################
+################################################################### 
 
 class ReactionNetwork:
     """
     Represents the structure and symbolic properties of a chemical reaction network.
     Handles network construction, symbolic ODE generation, and conservation law management.
     """
-    def __init__(self, n_complexes: int, n_reactions: int, n_lcs: int, n_species: int, L: np.ndarray, n_cons: int, seed: int, force_reverse: bool = True):
+    def __init__(self, n_species: int, 
+                 n_complexes: int, n_reactions: int, n_lcs: int,  
+                 L: np.ndarray, 
+                 seed: int, force_reverse: bool = True, subset_group_ind: int = None,
+                 complexes_per_class: List[int] = None, reactions_per_class: List[int] = None):
         """
         Constructs a ReactionNetwork instance. This is equivalent to the
         old `build_reaction_network` function.
         Ensures full reproducibility by using local RNGs for both numpy and Python random.
+        
+        Args:
+            n_species: Number of species in the network
+            n_complexes: Total number of complexes (used only if complexes_per_class is None)
+            n_reactions: Total number of reactions (used only if reactions_per_class is None)
+            n_lcs: Number of linkage classes (used only if complexes_per_class is None)
+            L: Conservation law matrix
+            seed: Random seed for reproducibility
+            force_reverse: Whether to force reversible reactions
+            subset_group_ind: Index of conservation group to focus on (optional)
+            complexes_per_class: List specifying number of complexes per linkage class (optional)
+            reactions_per_class: List specifying number of reactions per linkage class (optional)
         """
         self.seed = seed
         self.rng = np.random.default_rng(self.seed)
         self.py_rng = random.Random(self.seed)
-        self.n_tries = 200
+        self.n_tries = 1000
+
 
         for n in range(self.n_tries):
             try:
                 self.force_reverse = force_reverse
-                self.complexes_per_class, self.reactions_per_class = self._random_partition_complexes_and_reactions(
-                    n_complexes, n_reactions, n_lcs)
+                self.L = L
+                self.subset_group_ind = subset_group_ind
+                self.species_names = list(string.ascii_uppercase[:n_species])
+
+                # Use provided values or generate randomly
+                if complexes_per_class is not None and reactions_per_class is not None:
+                    # Validate provided values
+                    if len(complexes_per_class) != len(reactions_per_class):
+                        raise ValueError("complexes_per_class and reactions_per_class must have the same length")
+                    
+                    # Check that each class has at least 2 complexes
+                    if any(n < 2 for n in complexes_per_class):
+                        raise ValueError("Each linkage class must have at least 2 complexes")
+                    
+                    # Check that reactions per class is valid
+                    for i, (n_complexes, n_reactions) in enumerate(zip(complexes_per_class, reactions_per_class)):
+                        min_reactions = n_complexes - 1
+                        if self.force_reverse:
+                            max_reactions = n_complexes * (n_complexes - 1) // 2
+                        else:
+                            max_reactions = n_complexes * (n_complexes - 1)
+                        
+                        if n_reactions < min_reactions:
+                            raise ValueError(f"Linkage class {i} needs at least {min_reactions} reactions for {n_complexes} complexes")
+                        if n_reactions > max_reactions:
+                            raise ValueError(f"Linkage class {i} can have at most {max_reactions} reactions for {n_complexes} complexes")
+                    
+                    self.complexes_per_class = complexes_per_class
+                    self.reactions_per_class = reactions_per_class
+                else:
+                    self.complexes_per_class, self.reactions_per_class = self._random_partition_complexes_and_reactions(
+                        n_complexes, n_reactions, n_lcs)
+                
                 self.complexes_dict = generate_string_vector_dict(n_species)
+                
                 self.pairing_groups = generate_pairing_groups(L, self.complexes_dict)
+                
+                self.conservation_groups = self.get_conservation_groups()
+                self.within_pairing_groups, self.between_pairing_groups = self.get_within_between_pairing_groups()
+                
                 
                 self.linkage_groups = self._generate_linkage_class_graphs()
                 self.assignments = self._assign_complexes_to_linkage_groups()
 
-                self.species_names = list(string.ascii_uppercase[:n_species])
+                
                 self.Y, self.all_complexes = self._build_Y_matrix()
                 self.reactions = self._build_reaction_list(random_rates=True)
                 self.A = self._build_A_matrix_incidence()
                 self.Psi = self._build_Psi_function()
-                self.L = L
+                self.n_species = n_species
+                self.n_reactions = len(self.reactions)
+                n_cons = len(self.conservation_groups)
 
                 # deficiency check is now inside the try block
                 rank_YA = np.linalg.matrix_rank(self.Y @ self.A)
@@ -238,6 +128,84 @@ class ReactionNetwork:
             # This 'else' block executes only if the 'for' loop completes without a 'break'.
             # This means all 'n_tries' attempts failed.
             raise ValueError(f"Could not find a valid reaction network with the specified parameters after {self.n_tries} attempts.")
+
+    @classmethod
+    def from_reaction_strings(cls, reaction_strings: List[str], L: np.ndarray,
+                             seed: int = 42, force_reverse: bool = True, 
+                             subset_group_ind: int = None, random_rates: bool = True):
+        """
+        Alternate constructor that creates a ReactionNetwork from a list of reaction strings.
+        Validates that the provided conservation laws are consistent with the stoichiometric matrix.
+        
+        Args:
+            reaction_strings: List of reaction strings like ['A+B->C', 'C->D+E']
+            L: Conservation law matrix to validate against the stoichiometric matrix
+            seed: Random seed for reproducibility (used for rate generation)
+            force_reverse: If True, automatically adds reverse reactions for each input reaction
+            subset_group_ind: Index of conservation group to focus on (optional)
+            random_rates: Whether to assign random rates (True) or unit rates (False)
+            
+        Returns:
+            ReactionNetwork instance
+            
+        Raises:
+            ValueError: If the provided conservation laws are inconsistent with the stoichiometric matrix
+        """
+        # Parse reaction strings to extract complexes and reactions
+        complexes, reactions = parse_reaction_strings(reaction_strings, force_reverse)
+        
+        # Determine number of species from complexes
+        all_species = set()
+        for complex_str in complexes:
+            species_list = complex_str.split('+')
+            all_species.update(species_list)
+        n_species = len(all_species)
+        
+        # Create a minimal instance to set up basic attributes
+        instance = cls.__new__(cls)
+        instance.seed = seed
+        instance.rng = np.random.default_rng(instance.seed)
+        instance.py_rng = random.Random(instance.seed)
+        instance.force_reverse = force_reverse
+        instance.subset_group_ind = subset_group_ind
+        instance.species_names = sorted(list(all_species))
+        
+        # Build complexes dictionary for the actual species present
+        instance.complexes_dict = build_complexes_dict_from_complexes(complexes, instance.species_names)
+        
+        # Build Y matrix and all_complexes from the actual complexes
+        instance.Y, instance.all_complexes = build_Y_matrix_from_complexes(complexes, instance.complexes_dict, instance.species_names)
+        
+        # Build reactions list from parsed reactions
+        instance.reactions = build_reactions_from_parsed_reactions(reactions, instance.all_complexes, 
+                                                                  instance.rng, random_rates, force_reverse)
+        
+        # Build stoichiometric matrix and validate conservation laws
+        instance.A = instance._build_A_matrix_incidence()
+        validate_conservation_laws_against_stoichiometry(instance, L)
+        instance.L = L
+        
+        
+        # Build pairing groups and conservation groups
+        instance.pairing_groups = generate_pairing_groups(instance.L, instance.complexes_dict)
+        # Call these methods after the instance is fully set up
+        instance.conservation_groups = instance.get_conservation_groups()
+        instance.n_cons = len(instance.conservation_groups)
+        instance.within_pairing_groups, instance.between_pairing_groups = instance.get_within_between_pairing_groups()
+        
+        # Build remaining matrices and functions
+        instance.Psi = instance._build_Psi_function()
+        instance.n_species = n_species
+        instance.n_reactions = len(instance.reactions)
+        
+        # Set linkage groups and assignments (simplified for deterministic case)
+        instance.linkage_groups = build_linkage_groups_from_reactions(reactions, instance.all_complexes)
+        instance.assignments = build_assignments_from_linkage_groups(instance.linkage_groups, instance.all_complexes)
+        
+        # Compute and store complexes_per_class and reactions_per_class
+        instance.complexes_per_class, instance.reactions_per_class = compute_complexes_and_reactions_per_class(instance.linkage_groups)
+        
+        return instance
 
     def _random_partition_complexes_and_reactions(self, n_complexes, n_reactions, n_lcs):
         min_complexes_per_class = 2
@@ -261,17 +229,20 @@ class ReactionNetwork:
         if n_reactions < min_total_reactions:
             print(f"Setting n_reactions to minimum value: {min_total_reactions}")
             n_reactions = min_total_reactions
+
         if n_reactions > max_total_reactions:
             print(f"Setting n_reactions to maximum value: {max_total_reactions}")
             n_reactions = max_total_reactions
-
+            
         remaining_reactions = n_reactions - min_total_reactions
         reactions_per_class = min_reactions_per_class.copy()
+  
         
         for _ in range(remaining_reactions):
             eligible = np.where(reactions_per_class < max_reactions_per_class)[0]
-            if not eligible.any(): break
+            if len(eligible) == 0: break
             reactions_per_class[self.rng.choice(eligible)] += 1
+
 
         return complexes_per_class, reactions_per_class
 
@@ -284,6 +255,11 @@ class ReactionNetwork:
 
     def _assign_complexes_to_linkage_groups(self):
         pairing_groups_copy = self.pairing_groups[:]
+        if self.subset_group_ind is not None:
+            pairing_groups_copy = self.within_pairing_groups[:] + self.split_between_pairing_groups()[:]
+        else:
+            pairing_groups_copy = self.pairing_groups[:]
+
         used_complexes = set()
         assignments = []
 
@@ -332,6 +308,87 @@ class ReactionNetwork:
                     backward_rate = self.rng.uniform(0.1, 2.0) if random_rates else 1.0
                     reactions.append((complex_to_idx[v], complex_to_idx[u], backward_rate))
         return reactions
+    
+    def get_conservation_groups(self):
+        """Get groups of species that are conserved together"""
+        conservation_groups = []
+        for cg in range(len(self.L)):
+            conservation_groups.append([self.species_names[i] for i, val in enumerate(self.L[cg]) if val != 0])
+        return conservation_groups
+
+    def get_within_between_pairing_groups(self):
+        """Split pairing groups into within and between conservation groups"""
+        within_pairing_groups = []
+        between_pairing_groups = []
+        
+        for pg in self.pairing_groups:
+            complexes_in_pg = list(pg.keys())
+            mixed_bool = False
+            for c in complexes_in_pg:
+                if(len(c)) == 3:
+                    if not any(c[0] in cg and c[2] in cg for cg in self.conservation_groups):
+                        mixed_bool = True
+            if not mixed_bool:
+                within_pairing_groups.append(pg)
+            else:  
+                between_pairing_groups.append(pg)
+                
+        return within_pairing_groups, between_pairing_groups
+
+    def split_between_pairing_groups(self, subset_group_ind = None):
+        """Split between pairing groups based on a subset of species"""
+        split_groups = []
+        if subset_group_ind is None:
+            subset_group_ind = self.subset_group_ind
+        subset_group = self.conservation_groups[subset_group_ind]
+        for pg in self.between_pairing_groups:
+            for s in subset_group:
+                split_groups.append(dict())
+                for c in pg.keys():
+                    if s in c:
+                        split_groups[-1][c] = pg[c]
+        return split_groups
+    
+    def count_conservation_group_changes(self):
+        # Get conservation groups
+        conservation_groups = self.get_conservation_groups()
+
+        M_0t1 = 0
+        M_1t0 = 0 
+        M_0b1 = 0 # symmetric
+
+        # Loop through reactions and check conservation group membership
+        for i, (c1_idx, c2_idx, _) in enumerate(self.reactions):
+            c1 = self.all_complexes[c1_idx]
+            c2 = self.all_complexes[c2_idx]
+            
+            for pairing_group in self.within_pairing_groups:
+                if c1 in pairing_group and c2 in pairing_group.keys():
+                    break
+
+            for pairing_group in self.between_pairing_groups:
+                if c1 in pairing_group and c2 in pairing_group.keys():
+                    
+                    # Check stoichiometry changes for each conservation group
+                    cg_change_bool_vec = []
+                    for group_idx, group in enumerate(conservation_groups):
+                        # Count species from this group on each side
+                        # Get species in this group from each side
+                        c1_species = set(species for species in (c1.split('+') if len(c1)==3 else [c1]) if species in group)
+                        c2_species = set(species for species in (c2.split('+') if len(c2)==3 else [c2]) if species in group)
+                        # If counts differ, this group has a net change
+                        cg_change_bool_vec.append(c1_species != c2_species)
+                    
+                    if cg_change_bool_vec == [True, False]:
+                        M_1t0 += 1
+                    elif cg_change_bool_vec == [False, True]:
+                        M_0t1 += 1
+                    elif cg_change_bool_vec == [True, True]:
+                        M_0b1 += 1
+        
+                    break
+
+        return M_0t1, M_1t0, M_0b1
         
     def _build_A_matrix_incidence(self):
         n = len(self.all_complexes)
@@ -350,6 +407,54 @@ class ReactionNetwork:
             return np.array(vals)
         return Psi
 
+    def get_stoichiometric_matrix(self) -> np.ndarray:
+        """
+        Returns the stoichiometric matrix S with rows = species and columns = reactions.
+
+        For each reaction e corresponding to (i -> j), the e-th column of S is
+        given by Y[:, j] - Y[:, i]. The resulting matrix has shape
+        (n_species, n_reactions).
+        """
+        # Return cached matrix if available and consistent
+        if hasattr(self, "S") and self.S is not None and self.S.shape == (self.Y.shape[0], len(self.reactions)):
+            return self.S
+
+        n_species = self.Y.shape[0]
+        n_reactions = len(self.reactions)
+        S = np.zeros((n_species, n_reactions), dtype=int)
+        for e, (i, j, _) in enumerate(self.reactions):
+            S[:, e] = self.Y[:, j] - self.Y[:, i]
+
+        self.S = S
+        return S
+
+    def get_reaction_strings(self, include_rates: bool = True) -> List[str]:
+        """
+        Returns a list of human-readable strings describing each reaction
+        in terms of its source and target complexes.
+
+        Example item: "r3: A+B -> C ; k_3=1.25"
+
+        Args:
+            include_rates: whether to append numeric rate values
+        """
+        reaction_strings = []
+        for r_idx, (i, j, k_val) in enumerate(self.reactions):
+            src = self.all_complexes[i]
+            dst = self.all_complexes[j]
+            if include_rates:
+                reaction_strings.append(f"r{r_idx}: {src} -> {dst} ; k_{r_idx}={k_val:.6g}")
+            else:
+                reaction_strings.append(f"r{r_idx}: {src} -> {dst}")
+        return reaction_strings
+
+    def print_reactions(self, include_rates: bool = True) -> None:
+        """
+        Prints each reaction as a symbolic mapping of complexes.
+        """
+        for s in self.get_reaction_strings(include_rates=include_rates):
+            print(s)
+
     def update_rates(self, new_rates: List[float]):
         """
         Updates the reaction rate constants in place.
@@ -361,6 +466,44 @@ class ReactionNetwork:
 
         self.reactions = [(i, j, new_rate) for (i, j, _), new_rate in zip(self.reactions, new_rates)]
         self.A = self._build_A_matrix_incidence()
+
+    def compute_cycles(self):
+        """
+        Compute cycles in the reaction network by finding the nullspace of the stoichiometric matrix.
+        
+        Args:
+            r_n: ReactionNetwork instance
+            force_reverse: Boolean indicating if reactions are forced to be reversible
+            
+        Returns:
+            Z: Matrix of cycles
+            cycles: List of cycles where each cycle is a list of reaction strings
+        """
+        S = self.get_stoichiometric_matrix()
+ 
+        if self.force_reverse:
+            S_red = S[:,0:-1:2] 
+        else:
+            S_red = S
+
+        ns = sympy.Matrix(S_red).nullspace()  # list of column vectors
+        Z = sympy.Matrix.hstack(*ns) if ns else sympy.Matrix.zeros(S_red.shape[1], 0)
+        
+        
+        cycles = []
+        reaction_strings = self.get_reaction_strings(include_rates=False)
+        
+        for col in range(Z.shape[1]):
+            cycle = Z[:,col]
+            cycle_reactions = []
+            for ind in range(len(cycle)):
+                if cycle[ind] == 1:
+                    cycle_reactions.append(reaction_strings[2*ind])
+                if cycle[ind] == -1:
+                    cycle_reactions.append(reaction_strings[2*ind+1])
+            cycles.append(cycle_reactions)
+            
+        return Z, cycles
 
     
     
@@ -451,32 +594,70 @@ class ReactionNetworkSimulator:
         self.const_syms = const_syms
         self.elimination_solutions = elimination_solutions
 
-    def make_reduced_rhs_with_conservation(self, const_vals, rate_vals=None):
+    def make_reduced_rhs_with_conservation(self, const_vals=None, rate_vals=None):
         """
         Constructs a reduced ODE rhs function with conservation laws substituted in.
         Args:
-            const_vals: values for the conservation constants (list or array)
+            const_vals: values for the conservation constants (list or array) - optional for symbolic setup
             rate_vals: values for the rate constants (optional, defaults to r_n.rate_constants or [r[2] for r in r_n.reactions])
         Returns:
             ode_rhs(C): function of concentrations for the remaining species
         """
         
-        dCdt_sym, all_species_syms, rate_syms = self.get_symbolic_rhs()
-        species_names = [str(s) for s in all_species_syms]
-        species_map = {str(s): s for s in all_species_syms}
-        remaining_syms = [species_map[s] for s in self.remaining_species]
-        # Substitute solutions into the ODEs
-        solutions = {species_map[k]: v for k, v in self.elimination_solutions.items()}
-        substituted_rhs = [expr.subs(solutions, simultaneous=True) for expr in dCdt_sym]
-        rhs_kept = [substituted_rhs[species_names.index(s)] for s in self.remaining_species]
-        func_args = remaining_syms + self.const_syms + list(rate_syms)
-        rhs_func = sympy.lambdify(func_args, rhs_kept, modules=['numpy'])
-        rate_vals = [r[2] for r in self.r_n.reactions]
-        def reduced_ode_rhs(C):
+        # Only do symbolic substitution once if not already done
+        if not hasattr(self, '_substituted_rhs_func'):
+            dCdt_sym, all_species_syms, rate_syms = self.get_symbolic_rhs()
+            species_names = [str(s) for s in all_species_syms]
+            species_map = {str(s): s for s in all_species_syms}
+            remaining_syms = [species_map[s] for s in self.remaining_species]
+            
+            # Substitute solutions into the ODEs
+            solutions = {species_map[k]: v for k, v in self.elimination_solutions.items()}
+            substituted_rhs = [expr.subs(solutions, simultaneous=True) for expr in dCdt_sym]
+            rhs_kept = [substituted_rhs[species_names.index(s)] for s in self.remaining_species]
+            
+            # Create symbolic function with all parameters
+            func_args = remaining_syms + self.const_syms + list(rate_syms)
+            self._substituted_rhs_func = sympy.lambdify(func_args, rhs_kept, modules=['numpy'])
+            self._rate_syms = rate_syms
+        
+        # Get rate values (default if not provided)
+        if rate_vals is None:
+            rate_vals = [r[2] for r in self.r_n.reactions]
+        
+        # Create the numerical function with current const_vals
+        def reduced_ode_rhs(C, const_vals=const_vals):
             args = list(C) + list(const_vals) + list(rate_vals)
-            return np.array(rhs_func(*args)).flatten()
-        # Optionally store for later use
+            return np.array(self._substituted_rhs_func(*args)).flatten()
+        
+        # Store for later use
         self.reduced_ode_rhs = reduced_ode_rhs
+        return reduced_ode_rhs
+    
+    def make_reduced_rhs_with_conservation_flexible(self, rate_vals=None):
+        """
+        Creates a flexible reduced ODE rhs function that accepts const_vals as a parameter.
+        This allows changing const_vals without recreating the function.
+        
+        Args:
+            rate_vals: values for the rate constants (optional)
+        Returns:
+            ode_rhs(C, const_vals): function that takes both concentrations and const_vals
+        """
+        # Ensure symbolic substitution is done
+        if not hasattr(self, '_substituted_rhs_func'):
+            self.make_reduced_rhs_with_conservation()
+        
+        # Get rate values (default if not provided)
+        if rate_vals is None:
+            rate_vals = [r[2] for r in self.r_n.reactions]
+        
+        # Create flexible function that accepts const_vals as parameter
+        def flexible_reduced_ode_rhs(C, const_vals):
+            args = list(C) + list(const_vals) + list(rate_vals)
+            return np.array(self._substituted_rhs_func(*args)).flatten()
+        
+        return flexible_reduced_ode_rhs
 
     def get_const_and_reduced_init(self, C):
 
@@ -885,37 +1066,6 @@ class ReactionNetworkSimulator:
             jac_fn = jax.jacrev(lambda r: self.integrate_final_conc_jax(C0, r, t0, t1, dt0, max_steps))
         return jac_fn(rates)
 
-
-def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-8):
-    n_species = L.shape[1]
-    # Start from the NNLS solution as an initial guess
-    from scipy.optimize import nnls
-    C0, _ = nnls(L, const_vals)
-    C0 = np.maximum(C0, min_conc)
-
-    def variance(C):
-        return np.var(C)
-
-    constraints = [
-        {'type': 'eq', 'fun': lambda C: L @ C - const_vals},
-        {'type': 'ineq', 'fun': lambda C: C - min_conc}
-    ]
-
-    result = minimize(
-        variance,
-        C0,
-        constraints=constraints,
-        method='SLSQP',
-        options={'ftol': 1e-6, 'maxiter': 5000}
-    )
-
-    if not result.success:
-        raise RuntimeError("Optimization failed: " + result.message)
-    return result.x
-
-def compute_probs(C_full, L_vec, l0):
-    return (L_vec[:, np.newaxis] * C_full / l0) if C_full.ndim == 2 else (L_vec * C_full / l0)
-
 class InputData:
     """
     Manages labeled input data for training and testing.
@@ -963,3 +1113,452 @@ class InputData:
             self.refill_iterators()
             return next(self.training_data[class_number])
         
+
+##################################################################
+######################## Helper Functions ########################
+################################################################## 
+
+def random_connected_graph(n_nodes, n_edges, rng, seed, directed=False):
+    """
+    Generate a random connected graph with n_nodes and n_edges.
+    Uses local numpy and Python RNGs for full reproducibility.
+    Args:
+        n_nodes: Number of nodes
+        n_edges: Number of edges
+        directed: Whether the graph is directed
+        rng: numpy.random.Generator
+        py_rng: random.Random
+    Returns:
+        G: networkx Graph or DiGraph
+    """
+
+    nodes = list(range(n_nodes))
+    if directed:
+        G = nx.DiGraph()
+        G.add_nodes_from(nodes)
+        # Generate a random tree and orient edges randomly
+        tree = nx.random_tree(n_nodes, seed=seed)
+        for u, v in tree.edges():
+            if rng.random() < 0.5:
+                G.add_edge(u, v)
+            else:
+                G.add_edge(v, u)
+        # Add extra edges
+        possible_edges = [(i, j) for i in nodes for j in nodes if i != j and not G.has_edge(i, j)]
+        extra_edges_needed = n_edges - (n_nodes - 1)
+        if extra_edges_needed > 0:
+            extra_edges_indices = rng.choice(len(possible_edges), size=extra_edges_needed, replace=False)
+            for idx in extra_edges_indices:
+                u, v = possible_edges[idx]
+                G.add_edge(u, v)
+    else:
+        G = nx.random_tree(n_nodes, seed=seed)
+        # Add extra edges
+        possible_edges = [(i, j) for i in nodes for j in nodes if i < j and not G.has_edge(i, j)]
+        extra_edges_needed = n_edges - (n_nodes - 1)
+        if extra_edges_needed > 0:
+            extra_edges_indices = rng.choice(len(possible_edges), size=extra_edges_needed, replace=False)
+            for idx in extra_edges_indices:
+                u, v = possible_edges[idx]
+                G.add_edge(u, v)
+    return G
+
+
+def random_conservation_laws(n_cons, n_species, probs):
+    L = []
+    mc = len(probs)
+    for _ in range(n_cons):
+        not_all_zero = True
+        while not_all_zero:
+            values = np.arange(mc)  
+            row = np.random.choice(values, size=n_species, p=probs).tolist()
+            if sum(row) != 0:  # Exclude all-zero row
+                not_all_zero = False
+        L.append(row)
+    return np.array(L)
+
+
+def generate_string_vector_dict(n):
+    """
+    Generates a dictionary mapping complex names (as strings) to their
+    vector representations. Correctly handles complexes like "A+E" and "E+A"
+    as identical by creating a canonical (sorted) representation.
+    """
+    letters = list(string.ascii_uppercase[:n])
+    letter_indices = {letter: i for i, letter in enumerate(letters)}
+    result = {}
+
+    # Single letters
+    for letter in letters:
+        vec = np.zeros(n, dtype=int)
+        vec[letter_indices[letter]] = 1
+        result[letter] = vec
+
+    # Pairs
+    # Use itertools.combinations_with_replacement to get unique pairs (order doesn't matter)
+    for a, b in itertools.combinations_with_replacement(letters, 2):
+        vec = np.zeros(n, dtype=int)
+        vec[letter_indices[a]] += 1
+        vec[letter_indices[b]] += 1
+        
+        # Create a canonical key. Since combinations_with_replacement produces
+        # sorted output, we can just join them.
+        key = f"{a}+{b}"
+        result[key] = vec
+        
+    return result
+
+
+def find_valid_partners(c_b, L, complexes_dict):
+    s1 = complexes_dict[c_b]
+    valid_partners = {}
+    for c in complexes_dict:
+        s_test = complexes_dict[c]
+        diff = s1 - s_test
+        # Check if this complex satisfies conservation laws
+        if all(np.dot(l_vec, diff) == 0 for l_vec in L):
+            valid_partners[c] = s_test
+    return valid_partners
+
+
+def generate_pairing_groups(L, complexes_dict):
+    pairing_groups = []
+    available_complexes = set(complexes_dict.keys())
+    while available_complexes:
+        c = available_complexes.pop()
+        valid_partners = find_valid_partners(c, L, complexes_dict)
+        # Ensure the group is self-contained and we only store it once
+        canonical_group = frozenset(valid_partners.keys())
+        is_new = True
+        for group in pairing_groups:
+            if canonical_group == frozenset(group.keys()):
+                is_new = False
+                break
+        if is_new:
+             pairing_groups.append(valid_partners)
+        
+    return pairing_groups
+
+def generate_thermodynamic_rates(r_n, C0=1, beta=1, E_range=3, B_range=3, F_range=0, seed=None):
+    """
+    Generate reaction rates based on species energies and reaction barriers.
+    
+    Args:
+        r_n: ReactionNetwork instance
+        C0: Base concentration (default 1)
+        beta: Inverse temperature parameter (default 1) 
+        E_range: Range for random species energies (default 3)
+        B_range: Range for random reaction barriers (default 3)
+        F_range: Range for random reaction affinities (default 0)
+        seed: Random seed for reproducibility (default None)
+    
+    Returns:
+        List of reaction rates
+    """
+    if seed is not None:
+        np.random.seed(seed)
+        
+    species_energies = np.random.rand(r_n.n_species)*E_range
+    species_energies_dict = dict(zip(r_n.species_names, species_energies))
+    reaction_barriers = np.random.rand(r_n.n_reactions)*B_range
+    reaction_affinities = np.random.rand(r_n.n_reactions)*F_range
+
+    reac_rates = []
+    assert r_n.force_reverse
+    for reac_ind in range(int(len(r_n.reactions)/2)):
+        i, j, _ = r_n.reactions[3]
+        src_species = r_n.all_complexes[i].split("+")
+        stoich_src = len(src_species)
+        dst_species = r_n.all_complexes[j].split("+")
+        stoich_dst = len(dst_species)
+
+        src_energy = np.sum([species_energies_dict[s] for s in src_species])
+        dst_energy = np.sum([species_energies_dict[s] for s in dst_species])
+
+        fwd_rate = np.exp(beta*(reaction_barriers[reac_ind] - src_energy + reaction_affinities[reac_ind]/2)) * (C0**(1-stoich_src))
+        rev_rate = np.exp(beta*(reaction_barriers[reac_ind] - dst_energy - reaction_affinities[reac_ind]/2)) * (C0**(1-stoich_dst))
+        reac_rates.append(fwd_rate)
+        reac_rates.append(rev_rate)
+
+    return reac_rates
+
+def generate_initial_concentrations(L, base_concentrations=None, scale=4, offset_scale=3):
+    # Get nullspace basis vectors
+    nullspace = sympy.Matrix(L).nullspace()
+    
+    # Create random offset from nullspace vectors
+    if nullspace:
+        offset = offset_scale * sum(np.random.random() * np.array(v, dtype=float) for v in nullspace)
+        offset = offset.flatten()
+    else:
+        offset = np.zeros(L.shape[1])
+
+    # Create initial concentrations and add offset
+    if base_concentrations is None:
+        base_concentrations = np.ones(L.shape[1])
+    C = scale * base_concentrations
+    C = C + offset
+    
+    return C
+
+def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-8):
+    n_species = L.shape[1]
+    # Start from the NNLS solution as an initial guess
+    from scipy.optimize import nnls
+    C0, _ = nnls(L, const_vals)
+    C0 = np.maximum(C0, min_conc)
+
+    def variance(C):
+        return np.var(C)
+
+    constraints = [
+        {'type': 'eq', 'fun': lambda C: L @ C - const_vals},
+        {'type': 'ineq', 'fun': lambda C: C - min_conc}
+    ]
+
+    result = minimize(
+        variance,
+        C0,
+        constraints=constraints,
+        method='SLSQP',
+        options={'ftol': 1e-6, 'maxiter': 5000}
+    )
+
+    if not result.success:
+        raise RuntimeError("Optimization failed: " + result.message)
+    return result.x
+
+def parse_reaction_strings(reaction_strings: List[str], force_reverse: bool = False) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """
+    Parse a list of reaction strings to extract complexes and reactions.
+    
+    Args:
+        reaction_strings: List of strings like ['A+B->C', 'C->D+E']
+        force_reverse: If True, automatically add reverse reactions
+        
+    Returns:
+        complexes: List of unique complex strings
+        reactions: List of (reactant, product) tuples
+    """
+    complexes = set()
+    reactions = []
+    
+    for reaction_str in reaction_strings:
+        # Clean up whitespace and split on arrow
+        reaction_str = reaction_str.strip()
+        if '->' in reaction_str:
+            parts = reaction_str.split('->')
+        elif '→' in reaction_str:
+            parts = reaction_str.split('→')
+        else:
+            raise ValueError(f"Invalid reaction string: {reaction_str}. Must contain '->' or '→'")
+        
+        if len(parts) != 2:
+            raise ValueError(f"Invalid reaction string: {reaction_str}. Must have exactly one arrow.")
+        
+        reactant = parts[0].strip()
+        product = parts[1].strip()
+        
+        # Add complexes to set
+        complexes.add(reactant)
+        complexes.add(product)
+        
+        # Add forward reaction
+        reactions.append((reactant, product))
+        
+        # Add reverse reaction if force_reverse is True
+        if force_reverse:
+            reactions.append((product, reactant))
+    
+    return list(complexes), reactions
+
+def build_complexes_dict_from_complexes(complexes: List[str], species_names: List[str]) -> Dict[str, np.ndarray]:
+    """
+    Build complexes dictionary from a list of complex strings.
+    
+    Args:
+        complexes: List of complex strings like ['A', 'B', 'A+B']
+        species_names: List of species names in order
+        
+    Returns:
+        Dictionary mapping complex strings to stoichiometric vectors
+    """
+    species_indices = {species: i for i, species in enumerate(species_names)}
+    complexes_dict = {}
+    
+    for complex_str in complexes:
+        vec = np.zeros(len(species_names), dtype=int)
+        species_list = complex_str.split('+')
+        
+        for species in species_list:
+            species = species.strip()
+            if species in species_indices:
+                vec[species_indices[species]] += 1
+            else:
+                raise ValueError(f"Species {species} in complex {complex_str} not found in species_names")
+        
+        complexes_dict[complex_str] = vec
+    
+    return complexes_dict
+
+def build_Y_matrix_from_complexes(complexes: List[str], complexes_dict: Dict[str, np.ndarray], 
+                                 species_names: List[str]) -> Tuple[np.ndarray, List[str]]:
+    """
+    Build Y matrix and all_complexes list from complexes.
+    
+    Args:
+        complexes: List of complex strings
+        complexes_dict: Dictionary mapping complex strings to stoichiometric vectors
+        species_names: List of species names
+        
+    Returns:
+        Y: Stoichiometric matrix
+        all_complexes: List of complex strings in order
+    """
+    all_complexes = sorted(complexes)  # Sort for deterministic ordering
+    Y = np.zeros((len(species_names), len(all_complexes)), dtype=int)
+    
+    for j, complex_name in enumerate(all_complexes):
+        Y[:, j] = complexes_dict[complex_name]
+    
+    return Y, all_complexes
+
+def build_reactions_from_parsed_reactions(reactions: List[Tuple[str, str]], all_complexes: List[str], 
+                                         rng: np.random.Generator, random_rates: bool = True, 
+                                         force_reverse: bool = False) -> List[Tuple[int, int, float]]:
+    """
+    Build reactions list from parsed reactions.
+    
+    Args:
+        reactions: List of (reactant, product) tuples
+        all_complexes: List of complex strings in order
+        rng: Random number generator
+        random_rates: Whether to assign random rates
+        force_reverse: Whether reverse reactions were added during parsing
+        
+    Returns:
+        List of (reactant_idx, product_idx, rate) tuples
+    """
+    complex_to_idx = {complex_name: i for i, complex_name in enumerate(all_complexes)}
+    reaction_list = []
+    
+    for reactant, product in reactions:
+        reactant_idx = complex_to_idx[reactant]
+        product_idx = complex_to_idx[product]
+        
+        if random_rates:
+            rate = rng.uniform(0.1, 2.0)
+        else:
+            rate = 1.0
+            
+        reaction_list.append((reactant_idx, product_idx, rate))
+    
+    return reaction_list
+
+def build_linkage_groups_from_reactions(reactions: List[Tuple[str, str]], all_complexes: List[str]) -> List[nx.Graph]:
+    """
+    Build linkage groups from reactions by finding connected components.
+    
+    Args:
+        reactions: List of (reactant, product) tuples
+        all_complexes: List of complex strings
+        
+    Returns:
+        List of NetworkX graphs representing linkage classes
+    """
+    # Create a graph with complexes as nodes and reactions as edges
+    G = nx.Graph()
+    G.add_nodes_from(all_complexes)
+    
+    for reactant, product in reactions:
+        G.add_edge(reactant, product)
+    
+    # Find connected components (linkage classes)
+    linkage_groups = []
+    for component in nx.connected_components(G):
+        subgraph = G.subgraph(component)
+        linkage_groups.append(subgraph.copy())
+    
+    return linkage_groups
+
+def build_assignments_from_linkage_groups(linkage_groups: List[nx.Graph], all_complexes: List[str]) -> List[Dict]:
+    """
+    Build assignments from linkage groups.
+    
+    Args:
+        linkage_groups: List of NetworkX graphs
+        all_complexes: List of complex strings
+        
+    Returns:
+        List of assignment dictionaries
+    """
+    assignments = []
+    
+    for G in linkage_groups:
+        # Create a mapping from node indices to complex names
+        # Since the graph nodes are already the complex names, this is straightforward
+        node_assignment = {node: node for node in G.nodes()}
+        assignments.append(node_assignment)
+    
+    return assignments
+
+def compute_complexes_and_reactions_per_class(linkage_groups: List[nx.Graph]) -> Tuple[List[int], List[int]]:
+    """
+    Compute complexes_per_class and reactions_per_class from linkage groups.
+    
+    Args:
+        linkage_groups: List of NetworkX graphs representing linkage classes
+        
+    Returns:
+        complexes_per_class: List of number of complexes per linkage class
+        reactions_per_class: List of number of reactions per linkage class
+    """
+    complexes_per_class = []
+    reactions_per_class = []
+    
+    for G in linkage_groups:
+        n_complexes = G.number_of_nodes()
+        n_reactions = G.number_of_edges()
+        
+        complexes_per_class.append(n_complexes)
+        reactions_per_class.append(n_reactions)
+    
+    return complexes_per_class, reactions_per_class
+
+def validate_conservation_laws_against_stoichiometry(rn_instance, L: np.ndarray) -> None:
+    """
+    Validate that the provided conservation laws are consistent with the stoichiometric matrix.
+    
+    Args:
+        rn_instance: ReactionNetwork instance with stoichiometric matrix built
+        L: Conservation law matrix to validate
+        
+    Raises:
+        ValueError: If the conservation laws are inconsistent with the stoichiometric matrix
+    """
+    # Get the stoichiometric matrix
+    S = rn_instance.get_stoichiometric_matrix()
+    
+    # Check dimensions
+    if L.shape[1] != S.shape[0]:
+        raise ValueError(f"Conservation law matrix L has {L.shape[1]} columns but stoichiometric matrix S has {S.shape[0]} rows")
+    
+    # Check that L * S = 0 (conservation laws are in the left nullspace of S)
+    L_times_S = L @ S
+    if not np.allclose(L_times_S, 0, atol=1e-10):
+        raise ValueError("Conservation laws are inconsistent with the stoichiometric matrix. L * S should be zero.")
+    
+    # Check that L has full row rank (no redundant conservation laws)
+    if np.linalg.matrix_rank(L) < L.shape[0]:
+        raise ValueError("Conservation law matrix L has redundant rows (not full row rank)")
+    
+    # Check that the number of conservation laws is correct
+    # The number of conservation laws should equal n_species - rank(S)
+    expected_num_conservation_laws = S.shape[0] - np.linalg.matrix_rank(S)
+    if L.shape[0] != expected_num_conservation_laws:
+        raise ValueError(f"Expected {expected_num_conservation_laws} conservation laws but got {L.shape[0]}")
+
+
+def compute_probs(C_full, L_vec, l0):
+    return (L_vec[:, np.newaxis] * C_full / l0) if C_full.ndim == 2 else (L_vec * C_full / l0)
+
