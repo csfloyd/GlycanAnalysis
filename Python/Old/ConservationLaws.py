@@ -35,7 +35,8 @@ class ReactionNetwork:
                  n_complexes: int, n_reactions: int, n_lcs: int,  
                  L: np.ndarray, 
                  seed: int, force_reverse: bool = True, subset_group_ind: int = None,
-                 complexes_per_class: List[int] = None, reactions_per_class: List[int] = None):
+                 complexes_per_class: List[int] = None, reactions_per_class: List[int] = None,
+                 species_names: List[str] = None):
         """
         Constructs a ReactionNetwork instance. This is equivalent to the
         old `build_reaction_network` function.
@@ -52,6 +53,7 @@ class ReactionNetwork:
             subset_group_ind: Index of conservation group to focus on (optional)
             complexes_per_class: List specifying number of complexes per linkage class (optional)
             reactions_per_class: List specifying number of reactions per linkage class (optional)
+            species_names: List of species names. If None, uses default single-letter names (A, B, C, ...)
         """
         self.seed = seed
         self.rng = np.random.default_rng(self.seed)
@@ -64,7 +66,14 @@ class ReactionNetwork:
                 self.force_reverse = force_reverse
                 self.L = L
                 self.subset_group_ind = subset_group_ind
-                self.species_names = list(string.ascii_uppercase[:n_species])
+                
+                # Set species names - use provided names or default to single letters
+                if species_names is not None:
+                    if len(species_names) != n_species:
+                        raise ValueError(f"Expected {n_species} species names, but got {len(species_names)}")
+                    self.species_names = species_names
+                else:
+                    self.species_names = list(string.ascii_uppercase[:n_species])
 
                 # Use provided values or generate randomly
                 if complexes_per_class is not None and reactions_per_class is not None:
@@ -132,7 +141,8 @@ class ReactionNetwork:
     @classmethod
     def from_reaction_strings(cls, reaction_strings: List[str], L: np.ndarray,
                              seed: int = 42, force_reverse: bool = True, 
-                             subset_group_ind: int = None, random_rates: bool = True):
+                             subset_group_ind: int = None, random_rates: bool = True,
+                             species_names: List[str] = None):
         """
         Alternate constructor that creates a ReactionNetwork from a list of reaction strings.
         Validates that the provided conservation laws are consistent with the stoichiometric matrix.
@@ -144,6 +154,7 @@ class ReactionNetwork:
             force_reverse: If True, automatically adds reverse reactions for each input reaction
             subset_group_ind: Index of conservation group to focus on (optional)
             random_rates: Whether to assign random rates (True) or unit rates (False)
+            species_names: List of species names. If None, will be inferred from reactions
             
         Returns:
             ReactionNetwork instance
@@ -154,12 +165,19 @@ class ReactionNetwork:
         # Parse reaction strings to extract complexes and reactions
         complexes, reactions = parse_reaction_strings(reaction_strings, force_reverse)
         
-        # Determine number of species from complexes
-        all_species = set()
-        for complex_str in complexes:
-            species_list = complex_str.split('+')
-            all_species.update(species_list)
-        n_species = len(all_species)
+        # Determine species names and number of species
+        if species_names is not None:
+            # Use provided species names
+            instance_species_names = species_names
+            n_species = len(species_names)
+        else:
+            # Infer species names from complexes
+            all_species = set()
+            for complex_str in complexes:
+                species_list = complex_str.split('+')
+                all_species.update(species_list)
+            instance_species_names = sorted(list(all_species))
+            n_species = len(all_species)
         
         # Create a minimal instance to set up basic attributes
         instance = cls.__new__(cls)
@@ -168,7 +186,7 @@ class ReactionNetwork:
         instance.py_rng = random.Random(instance.seed)
         instance.force_reverse = force_reverse
         instance.subset_group_ind = subset_group_ind
-        instance.species_names = sorted(list(all_species))
+        instance.species_names = instance_species_names
         
         # Build complexes dictionary for the actual species present
         instance.complexes_dict = build_complexes_dict_from_complexes(complexes, instance.species_names)
@@ -182,8 +200,13 @@ class ReactionNetwork:
         
         # Build stoichiometric matrix and validate conservation laws
         instance.A = instance._build_A_matrix_incidence()
+        if L is None:
+            # Get the stoichiometric matrix and compute conservation laws
+            S = instance.get_stoichiometric_matrix()
+            L = compute_conservation_laws_from_stoichiometry_matrix(S)
         validate_conservation_laws_against_stoichiometry(instance, L)
         instance.L = L
+    
         
         
         # Build pairing groups and conservation groups
@@ -1333,7 +1356,7 @@ def parse_reaction_strings(reaction_strings: List[str], force_reverse: bool = Fa
     Parse a list of reaction strings to extract complexes and reactions.
     
     Args:
-        reaction_strings: List of strings like ['A+B->C', 'C->D+E']
+        reaction_strings: List of strings like ['A+B->C', 'C->D+E', '2*A + B -> C']
         force_reverse: If True, automatically add reverse reactions
         
     Returns:
@@ -1372,30 +1395,70 @@ def parse_reaction_strings(reaction_strings: List[str], force_reverse: bool = Fa
     
     return list(complexes), reactions
 
+def parse_complex_string(complex_str: str, species_names: List[str]) -> Dict[str, int]:
+    """
+    Parse a complex string to extract species and their stoichiometric coefficients.
+    
+    Args:
+        complex_str: Complex string like '2*A + B' or 'A + 3*B'
+        species_names: List of valid species names
+        
+    Returns:
+        Dictionary mapping species names to their stoichiometric coefficients
+    """
+    species_coeffs = {}
+    
+    # Split by '+' and process each part
+    parts = [part.strip() for part in complex_str.split('+')]
+    
+    for part in parts:
+        if not part:  # Skip empty parts
+            continue
+            
+        # Look for stoichiometric coefficient pattern: number*species
+        if '*' in part:
+            coeff_part, species_part = part.split('*', 1)
+            try:
+                coeff = int(coeff_part.strip())
+                species = species_part.strip()
+            except ValueError:
+                # If coefficient parsing fails, assume coefficient is 1
+                coeff = 1
+                species = part.strip()
+        else:
+            # No coefficient specified, assume coefficient is 1
+            coeff = 1
+            species = part.strip()
+        
+        # Validate that the species is in our list
+        if species in species_names:
+            species_coeffs[species] = species_coeffs.get(species, 0) + coeff
+        else:
+            raise ValueError(f"Species '{species}' in complex '{complex_str}' not found in species_names: {species_names}")
+    
+    return species_coeffs
+
 def build_complexes_dict_from_complexes(complexes: List[str], species_names: List[str]) -> Dict[str, np.ndarray]:
     """
     Build complexes dictionary from a list of complex strings.
     
     Args:
-        complexes: List of complex strings like ['A', 'B', 'A+B']
+        complexes: List of complex strings like ['A', 'B', 'A+B', '2*A + B']
         species_names: List of species names in order
         
     Returns:
         Dictionary mapping complex strings to stoichiometric vectors
     """
-    species_indices = {species: i for i, species in enumerate(species_names)}
     complexes_dict = {}
     
     for complex_str in complexes:
         vec = np.zeros(len(species_names), dtype=int)
-        species_list = complex_str.split('+')
+        species_coeffs = parse_complex_string(complex_str, species_names)
         
-        for species in species_list:
-            species = species.strip()
-            if species in species_indices:
-                vec[species_indices[species]] += 1
-            else:
-                raise ValueError(f"Species {species} in complex {complex_str} not found in species_names")
+        # Fill the vector with stoichiometric coefficients
+        for species, coeff in species_coeffs.items():
+            species_index = species_names.index(species)
+            vec[species_index] = coeff
         
         complexes_dict[complex_str] = vec
     
@@ -1424,8 +1487,7 @@ def build_Y_matrix_from_complexes(complexes: List[str], complexes_dict: Dict[str
     return Y, all_complexes
 
 def build_reactions_from_parsed_reactions(reactions: List[Tuple[str, str]], all_complexes: List[str], 
-                                         rng: np.random.Generator, random_rates: bool = True, 
-                                         force_reverse: bool = False) -> List[Tuple[int, int, float]]:
+                                         rng: np.random.Generator, random_rates: bool = True) -> List[Tuple[int, int, float]]:
     """
     Build reactions list from parsed reactions.
     
@@ -1562,3 +1624,107 @@ def validate_conservation_laws_against_stoichiometry(rn_instance, L: np.ndarray)
 def compute_probs(C_full, L_vec, l0):
     return (L_vec[:, np.newaxis] * C_full / l0) if C_full.ndim == 2 else (L_vec * C_full / l0)
 
+def check_integer_and_nonnegative(L: np.ndarray) -> bool:
+    return np.all(np.mod(L, 1) == 0) and np.all(L >= 0)
+
+def compute_conservation_laws_from_stoichiometry_matrix(S: np.ndarray) -> np.ndarray:
+    """
+    Compute conservation laws L from a stoichiometry matrix as the left nullspace vectors
+    with non-negative integer entries.
+    
+    The conservation laws are vectors l such that l^T * S = 0, where S is the 
+    stoichiometric matrix. This function finds integer combinations of nullspace basis
+    vectors that have non-negative entries.
+    
+    Args:
+        S: Stoichiometric matrix with shape (n_species, n_reactions)
+        
+    Returns:
+        np.ndarray: Conservation law matrix L with shape (n_conservation_laws, n_species)
+                    where each row represents a conservation law with non-negative integer entries
+        
+    Raises:
+        ValueError: If no non-negative integer conservation laws can be found
+    """
+    # Convert to sympy matrix for exact computation
+    S_sympy = sympy.Matrix(S)
+    
+    # Find the left nullspace of S (nullspace of S^T)
+    # The left nullspace consists of vectors l such that l^T * S = 0
+    # This is equivalent to finding the nullspace of S^T
+    S_transpose = S_sympy.T
+    
+    # Use sympy's nullspace function for exact computation
+    nullspace_vectors = S_transpose.nullspace()
+    
+    if not nullspace_vectors:
+        # No conservation laws found
+        return np.array([]).reshape(0, S.shape[0])
+    
+    # Convert sympy vectors to numpy array
+    nullspace_basis = np.array([list(vector) for vector in nullspace_vectors], dtype=float)
+    
+    # Ensure we have a 2D array even if only one conservation law
+    if nullspace_basis.ndim == 1:
+        nullspace_basis = nullspace_basis.reshape(1, -1)
+    
+    n_basis_vectors = nullspace_basis.shape[0]
+    
+    # Try integer combinations of the basis vectors
+    max_coeff = 5  # Maximum coefficient to try
+    
+    conservation_laws = []
+    
+    # Generate all combinations of coefficients
+    coeff_ranges = [range(-max_coeff, max_coeff + 1)] * n_basis_vectors
+    
+    # Try all combinations in one loop
+    for coeffs in itertools.product(*coeff_ranges):
+        # Skip the zero combination
+        if all(c == 0 for c in coeffs):
+            continue
+            
+        # Compute the linear combination
+        combination = np.dot(coeffs, nullspace_basis)
+        
+        # Check if it's integer and non-negative
+        if check_integer_and_nonnegative(combination) and not np.allclose(combination, 0):
+            # Check if this combination is in the span of the current conservation laws
+            if len(conservation_laws) == 0:
+                conservation_laws.append(combination)
+            else:
+                # Create matrix of current conservation laws
+                current_matrix = np.array(conservation_laws)
+                
+                # Try to solve: current_matrix * x = combination
+                # If there's a solution, the combination is in the span
+                try:
+                    # Use least squares to find coefficients
+                    coeffs, residuals, rank, s = np.linalg.lstsq(current_matrix.T, combination, rcond=None)
+                    
+                    # Check if the residual is small (meaning it's in the span)
+                    if len(residuals) > 0 and residuals[0] < 1e-10:
+                        # It's in the span, so skip it
+                        continue
+                    else:
+                        # Not in the span, so add it
+                        conservation_laws.append(combination)
+                except np.linalg.LinAlgError:
+                    # If the system is underdetermined, it might still be in the span
+                    # Try a different approach: check if the augmented matrix has the same rank
+                    augmented_matrix = np.vstack([current_matrix, combination])
+                    if np.linalg.matrix_rank(augmented_matrix) == np.linalg.matrix_rank(current_matrix):
+                        # Same rank means it's in the span
+                        continue
+                    else:
+                        # Different rank means it's not in the span
+                        conservation_laws.append(combination)
+    
+    if not conservation_laws:
+        raise ValueError("No non-negative integer conservation laws found. "
+                        "The nullspace vectors do not admit non-negative integer combinations.")
+    
+    # Convert to numpy array
+    L = np.array(conservation_laws, dtype=int)
+    
+    return L
