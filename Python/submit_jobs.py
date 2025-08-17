@@ -2,7 +2,7 @@ import os
 import shutil
 
 n_params = 1
-output_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/n_reactions/"
+output_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/n_reactions_3/"
 
 # Define the range of values for param1 and labels for param2
 param1_values = [6, 7, 8, 9, 10, 11, 12] 
@@ -11,9 +11,9 @@ param2_values = []
 # SLURM job template
 job_template = """#!/bin/bash
 #SBATCH --job-name=computation
-#SBATCH --output={output}/training_batch.out   # Redirect stdout to the output directory
-#SBATCH --error={output}/training_batch.err    # Redirect stderr to the output directory
-#SBATCH --time=32:00:00
+#SBATCH --output={output}/CRN_training.out   # Redirect stdout to the output directory
+#SBATCH --error={output}/CRN_training.err    # Redirect stderr to the output directory
+#SBATCH --time=12:00:00
 #SBATCH --partition=caslake
 ##SBATCH --partition=svaikunt 
 #SBATCH --account=pi-svaikunt
@@ -57,8 +57,8 @@ if n_params == 1:
 # SLURM job template
 job_template_2 = """#!/bin/bash
 #SBATCH --job-name=computation
-#SBATCH --output={output}/training_batch.out   # Redirect stdout to the output directory
-#SBATCH --error={output}/training_batch.err    # Redirect stderr to the output directory
+#SBATCH --output={output}/CRN_training.out   # Redirect stdout to the output directory
+#SBATCH --error={output}/CRN_training.err    # Redirect stderr to the output directory
 #SBATCH --time=5:00:00
 #SBATCH --partition=caslake
 ##SBATCH --partition=svaikunt 
@@ -68,7 +68,7 @@ job_template_2 = """#!/bin/bash
 
 # module load python3
 
-python3 /project/svaikunt/csfloyd/TrainingCRNs/Python/TrainingMidwayStacked.py --param1 {param1} --param2 {param2} --output {output}
+python3 /project/svaikunt/csfloyd/TrainingCRNs/Python/run_scan.py --param1 {param1} --param2 {param2} --output {output}
 """
 
 if n_params == 2:

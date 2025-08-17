@@ -92,15 +92,18 @@ def generate_thermodynamic_rates(r_n, C0=1, beta=1, E_range=3, B_range=3, F_rang
     if seed is not None:
         np.random.seed(seed)
         
-    species_energies = np.random.rand(r_n.n_species)*E_range
+    assert r_n.force_reverse
+    n_reversible_reactions = int(len(r_n.reactions)/2)
+
+    species_energies = np.random.uniform(-E_range, E_range, r_n.n_species)
     species_energies_dict = dict(zip(r_n.species_names, species_energies))
-    reaction_barriers = np.random.rand(r_n.n_reactions)*B_range
-    reaction_affinities = np.random.rand(r_n.n_reactions)*F_range
+    reaction_barriers = np.random.uniform(-B_range, B_range, n_reversible_reactions)
+    reaction_affinities = np.random.uniform(-F_range, F_range, n_reversible_reactions)
 
     reac_rates = []
-    assert r_n.force_reverse
-    for reac_ind in range(int(len(r_n.reactions)/2)):
-        i, j, _ = r_n.reactions[3]
+    
+    for reac_ind in range(n_reversible_reactions):
+        i, j, _ = r_n.reactions[2*reac_ind]
         src_species = r_n.all_complexes[i].split("+")
         stoich_src = len(src_species)
         dst_species = r_n.all_complexes[j].split("+")
@@ -109,8 +112,8 @@ def generate_thermodynamic_rates(r_n, C0=1, beta=1, E_range=3, B_range=3, F_rang
         src_energy = np.sum([species_energies_dict[s] for s in src_species])
         dst_energy = np.sum([species_energies_dict[s] for s in dst_species])
 
-        fwd_rate = np.exp(beta*(reaction_barriers[reac_ind] - src_energy + reaction_affinities[reac_ind]/2)) * (C0**(1-stoich_src))
-        rev_rate = np.exp(beta*(reaction_barriers[reac_ind] - dst_energy - reaction_affinities[reac_ind]/2)) * (C0**(1-stoich_dst))
+        fwd_rate = np.exp(beta*(-reaction_barriers[reac_ind] + src_energy + reaction_affinities[reac_ind]/2)) * (C0**(1-stoich_src))
+        rev_rate = np.exp(beta*(-reaction_barriers[reac_ind] + dst_energy - reaction_affinities[reac_ind]/2)) * (C0**(1-stoich_dst))
         reac_rates.append(fwd_rate)
         reac_rates.append(rev_rate)
 

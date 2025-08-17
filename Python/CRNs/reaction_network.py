@@ -51,7 +51,7 @@ class ReactionNetwork:
         self.seed = seed
         self.rng = np.random.default_rng(self.seed)
         self.py_rng = random.Random(self.seed)
-        self.n_tries = 1000
+        self.n_tries = 5000
 
         for n in range(self.n_tries):
             try:
@@ -110,6 +110,8 @@ class ReactionNetwork:
                 self.reactions = self._build_reaction_list(random_rates=True)
                 self.A = self._build_A_matrix_incidence()
                 self.Psi = self._build_Psi_function()
+                self.n_complexes = len(self.all_complexes)
+                self.n_lcs = len(self.linkage_groups)
                 self.n_species = n_species
                 self.n_reactions = len(self.reactions)
                 self.n_cons = len(self.conservation_groups)
@@ -206,7 +208,9 @@ class ReactionNetwork:
         # Build remaining matrices and functions
         instance.Psi = instance._build_Psi_function()
         instance.n_species = n_species
+        instance.n_complexes = len(instance.all_complexes)
         instance.n_reactions = len(instance.reactions)
+        instance.n_lcs = len(instance.linkage_groups)
         
         # Set linkage groups and assignments (simplified for deterministic case)
         instance.linkage_groups = instance._build_linkage_groups(reactions)
@@ -647,45 +651,83 @@ class ReactionNetwork:
 
     def _random_partition_complexes_and_reactions(self, n_complexes, n_reactions, n_lcs):
         """Randomly partition complexes and reactions into linkage classes."""
-        # Randomly partition complexes into linkage classes
-        complexes_per_class = []
-        remaining_complexes = n_complexes
+        # # Randomly partition complexes into linkage classes
+        # complexes_per_class = []
+        # remaining_complexes = n_complexes
         
-        for i in range(n_lcs - 1):
-            if remaining_complexes <= n_lcs - i:
-                # Distribute remaining complexes evenly
-                complexes_per_class.append(1)
-            else:
-                # Randomly choose number of complexes for this class
-                max_complexes = remaining_complexes - (n_lcs - i - 1)
-                n_complexes_class = self.rng.integers(2, max_complexes + 1)
-                complexes_per_class.append(n_complexes_class)
-                remaining_complexes -= n_complexes_class
+        # for i in range(n_lcs - 1):
+        #     if remaining_complexes <= n_lcs - i:
+        #         # Distribute remaining complexes evenly
+        #         complexes_per_class.append(1)
+        #     else:
+        #         # Randomly choose number of complexes for this class
+        #         max_complexes = remaining_complexes - (n_lcs - i - 1)
+        #         n_complexes_class = self.rng.integers(2, max_complexes + 1)
+        #         complexes_per_class.append(n_complexes_class)
+        #         remaining_complexes -= n_complexes_class
         
-        # Put remaining complexes in the last class
-        complexes_per_class.append(remaining_complexes)
+        # # Put remaining complexes in the last class
+        # complexes_per_class.append(remaining_complexes)
         
-        # Randomly partition reactions into linkage classes
-        reactions_per_class = []
-        remaining_reactions = n_reactions
+        # # Randomly partition reactions into linkage classes
+        # reactions_per_class = []
+        # remaining_reactions = n_reactions
         
-        for i, n_complexes in enumerate(complexes_per_class):
-            if i == n_lcs - 1:
-                # Put remaining reactions in the last class
-                reactions_per_class.append(remaining_reactions)
-            else:
-                # Randomly choose number of reactions for this class
-                min_reactions = n_complexes - 1
-                if self.force_reverse:
-                    max_reactions = n_complexes * (n_complexes - 1) // 2
-                else:
-                    max_reactions = n_complexes * (n_complexes - 1)
+        # for i, n_complexes in enumerate(complexes_per_class):
+        #     if i == n_lcs - 1:
+        #         # Put remaining reactions in the last class
+        #         reactions_per_class.append(remaining_reactions)
+        #     else:
+        #         # Randomly choose number of reactions for this class
+        #         min_reactions = n_complexes - 1
+        #         if self.force_reverse:
+        #             max_reactions = n_complexes * (n_complexes - 1) // 2
+        #         else:
+        #             max_reactions = n_complexes * (n_complexes - 1)
                 
-                max_possible = min(max_reactions, remaining_reactions - (n_lcs - i - 1))
-                n_reactions_class = self.rng.integers(min_reactions, max_possible + 1)
-                reactions_per_class.append(n_reactions_class)
-                remaining_reactions -= n_reactions_class
+        #         max_possible = min(max_reactions, remaining_reactions - (n_lcs - i - 1))
+        #         n_reactions_class = self.rng.integers(min_reactions, max_possible + 1)
+        #         reactions_per_class.append(n_reactions_class)
+        #         remaining_reactions -= n_reactions_class
         
+        # return complexes_per_class, reactions_per_class
+
+        min_complexes_per_class = 2
+        min_total_complexes = n_lcs * min_complexes_per_class
+        if n_complexes < min_total_complexes:
+            raise ValueError("Not enough complexes to give at least 2 to each class.")
+        
+        remaining_complexes = n_complexes - min_total_complexes
+        extra_complexes = self.rng.multinomial(remaining_complexes, [1/n_lcs]*n_lcs) if remaining_complexes > 0 else np.zeros(n_lcs, dtype=int)
+        complexes_per_class = min_complexes_per_class + extra_complexes
+
+        min_reactions_per_class = complexes_per_class - 1
+        if self.force_reverse:
+            max_reactions_per_class = (complexes_per_class * (complexes_per_class - 1) // 2).astype(int)
+        else:
+            max_reactions_per_class = (complexes_per_class * (complexes_per_class - 1)).astype(int)
+        
+        min_total_reactions = min_reactions_per_class.sum()
+        max_total_reactions = max_reactions_per_class.sum()
+        
+        if n_reactions < min_total_reactions:
+            print(f"Setting n_reactions to minimum value: {min_total_reactions}")
+            n_reactions = min_total_reactions
+
+        if n_reactions > max_total_reactions:
+            print(f"Setting n_reactions to maximum value: {max_total_reactions}")
+            n_reactions = max_total_reactions
+            
+        remaining_reactions = n_reactions - min_total_reactions
+        reactions_per_class = min_reactions_per_class.copy()
+  
+        
+        for _ in range(remaining_reactions):
+            eligible = np.where(reactions_per_class < max_reactions_per_class)[0]
+            if len(eligible) == 0: break
+            reactions_per_class[self.rng.choice(eligible)] += 1
+
+
         return complexes_per_class, reactions_per_class
     
     def _generate_linkage_class_graphs(self):

@@ -10,6 +10,7 @@ import sympy
 import itertools
 from typing import List, Dict, Tuple
 
+
 def count_conservation_group_changes(r_n):
     # Get conservation groups
     conservation_groups = r_n.get_conservation_groups()
