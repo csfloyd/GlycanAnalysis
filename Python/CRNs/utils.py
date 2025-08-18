@@ -7,6 +7,7 @@ and performing common operations.
 
 import numpy as np
 from typing import List, Dict, Tuple
+from CRNs.generation import generate_positive_initial_concentrations_nnls
 from dataclasses import dataclass
 import random
 import time
@@ -159,6 +160,7 @@ def compute_probs(C_full, L_vec, l0):
         Probability array
     """
     return (L_vec[:, np.newaxis] * C_full / l0) if C_full.ndim == 2 else (L_vec * C_full / l0)
+
 
 
 @dataclass
@@ -324,3 +326,243 @@ class NetworkDataLogger:
     def clear_data(self):
         """Clear all logged data."""
         self.network_data = []
+
+class AdaptiveSampler:
+    """
+    Adaptive sampler for sign conditions using Good-Turing-like convergence criteria.
+    
+    This class implements adaptive sampling that continues until convergence
+    is reached based on the rate of discovery of new sign conditions.
+    """
+    
+    def __init__(self, 
+                 min_samples: int = 20,
+                 max_samples: int = 1000,
+                 convergence_window: int = 20,
+                 convergence_threshold: float = 0.02,
+                 timeout_seconds: int = 30,
+                 l0_range: tuple = (0.0001, 1000.0),
+                 profiler: TimeProfiler = None):
+        """
+        Initialize the adaptive sampler.
+        
+        Args:
+            min_samples: Minimum number of samples before checking convergence
+            max_samples: Maximum number of samples to prevent infinite loops
+            convergence_window: Number of recent samples to check for convergence
+            convergence_threshold: Fraction of new sign conditions below which to stop
+            timeout_seconds: Timeout for individual sample generation
+            profiler: Optional TimeProfiler instance for timing
+        """
+        self.min_samples = min_samples
+        self.max_samples = max_samples
+        self.convergence_window = convergence_window
+        self.convergence_threshold = convergence_threshold
+        self.timeout_seconds = timeout_seconds
+        self.profiler = profiler
+        self.l0_range = l0_range
+        # Sampling state
+        self.sign_conditions = []
+        self.C_full_list = []
+        self.sample_count = 0
+        self.new_sign_count = 0
+        self.convergence_history = []
+        
+    def _check_convergence(self) -> bool:
+        """
+        Check if sampling has converged based on recent discovery rate.
+        
+        Returns:
+            True if converged, False otherwise
+        """
+        if self.sample_count < self.min_samples:
+            return False
+            
+        if self.sample_count >= self.max_samples:
+            return True
+            
+        # Calculate discovery rate in recent window
+        if len(self.convergence_history) >= self.convergence_window:
+            recent_discovery_rate = sum(self.convergence_history[-self.convergence_window:]) / self.convergence_window
+            return recent_discovery_rate <= self.convergence_threshold
+            
+        return False
+    
+    def _get_sign_sample(self, sim, L, t_span, num_points, int_method, r_tol, a_tol):
+        """
+        Generate a single sign sample with all necessary computations.
+        
+        Args:
+            sim: ReactionNetworkSimulator instance
+            L: Conservation law matrix
+            t_span: Integration time span
+            num_points: Number of integration points
+            int_method: Integration method
+            r_tol: Relative tolerance
+            a_tol: Absolute tolerance
+            
+        Returns:
+            tuple: (signs, C_full, success) where success is boolean
+        """
+        try:
+            # Sample initial conditions
+            l0 = np.exp(np.random.uniform(np.log(self.l0_range[0]), np.log(self.l0_range[1]), size=L.shape[0]))
+            
+            if self.profiler:
+                self.profiler.start_timer("nnls")
+            
+            # Generate initial concentrations
+            C_full = generate_positive_initial_concentrations_nnls(L, l0)
+            
+            if self.profiler:
+                self.profiler.end_timer("nnls")
+                self.profiler.start_timer("initial_conditions")
+            
+            # Get reduced initial conditions
+            _, C_reduced_init = sim.get_const_and_reduced_init(C_full)
+            
+            if self.profiler:
+                self.profiler.end_timer("initial_conditions")
+                self.profiler.start_timer("integration")
+            
+            # Set up timeout for integration
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(self.timeout_seconds)
+            
+            try:
+                # Create flexible RHS function
+                flexible_reduced_ode_rhs = sim.make_reduced_rhs_with_conservation_flexible()
+                
+                # Integrate ODE
+                sol_reduced, C_reduced_final = sim.integrate(
+                    lambda C: flexible_reduced_ode_rhs(C, l0), 
+                    C_reduced_init, 
+                    t_span=t_span,
+                    num_points=num_points, 
+                    method=int_method, 
+                    rtol=r_tol, 
+                    atol=a_tol
+                )
+                
+                signal.alarm(0)  # Cancel timeout
+                
+                if self.profiler:
+                    self.profiler.end_timer("integration")
+                    self.profiler.start_timer("species_recovery")
+                
+                # Recover full species concentrations
+                C_full = sim.recover_eliminated_species(l0, C_reduced_final)
+                
+                if self.profiler:
+                    self.profiler.end_timer("species_recovery")
+                    self.profiler.start_timer("sensitivity_analysis")
+                
+                # Compute sensitivity derivatives
+                rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
+                dR_dC, dR_dC_func, dR_dl, dR_dl_func, dR_dk, dR_dk_func, _ = sim.get_first_order_derivatives()
+                
+                dC_dl = sim.dC_dl_func(C_reduced_final, l0, rates, dR_dC_func, dR_dl_func)
+                dC_dl_full = sim.compute_dC_dk_full(dC_dl)
+                
+                if self.profiler:
+                    self.profiler.end_timer("sensitivity_analysis")
+                    self.profiler.start_timer("sign_processing")
+                
+                # Extract sign conditions
+                signs = np.sign(np.round(dC_dl_full, decimals=12)).tolist()
+                
+                if self.profiler:
+                    self.profiler.end_timer("sign_processing")
+                
+                return signs, C_full, True
+                
+            except TimeoutError:
+                signal.alarm(0)  # Cancel timeout
+                if self.profiler:
+                    self.profiler.end_timer("integration")
+                return None, None, False
+                
+        except Exception as e:
+            print(e)
+            if self.profiler:
+                # End any active timers
+                for timer_name in ["nnls", "initial_conditions", "integration", "species_recovery", "sensitivity_analysis", "sign_processing"]:
+                    if timer_name in self.profiler.timers and self.profiler.timers[timer_name]['start_time'] is not None:
+                        self.profiler.end_timer(timer_name)
+            return None, None, False
+    
+    def sample_sign_conditions(self, sim, L, t_span, num_points, int_method, r_tol, a_tol):
+        """
+        Perform adaptive sampling of sign conditions.
+        
+        Args:
+            sim: ReactionNetworkSimulator instance
+            L: Conservation law matrix
+            t_span: Integration time span
+            num_points: Number of integration points
+            int_method: Integration method
+            r_tol: Relative tolerance
+            a_tol: Absolute tolerance
+            
+        Returns:
+            tuple: (sign_conditions, C_full_list, sample_count, convergence_reached)
+        """
+        # print(f"Starting adaptive sampling (min: {self.min_samples}, max: {self.max_samples})")
+        
+        while not self._check_convergence():
+            self.sample_count += 1
+            
+            # if self.sample_count % 10 == 0:
+            #     print(f"  Sample {self.sample_count}, unique sign conditions: {len(set(str(s) for s in self.sign_conditions))}")
+            
+            # Generate sign sample
+            signs, C_full, success = self._get_sign_sample(sim, L, t_span, num_points, int_method, r_tol, a_tol)
+            
+            if not success:
+                continue
+            
+            # Check if this is a new sign condition
+            signs_str = str(signs)
+            is_new = True
+            for existing_signs in self.sign_conditions:
+                if str(existing_signs) == signs_str:
+                    is_new = False
+                    break
+
+            # Update tracking
+            self.convergence_history.append(1 if is_new else 0)
+            if is_new:
+                self.new_sign_count += 1
+                self.sign_conditions.append(signs)
+                self.C_full_list.append(C_full)
+        
+        convergence_reached = self._check_convergence()
+        unique_sign_conditions = len(set(str(s) for s in self.sign_conditions))
+        
+        # print(f"Sampling complete: {self.sample_count} samples, {unique_sign_conditions} unique sign conditions")
+        # if convergence_reached:
+        #     print(f"Convergence reached after {self.sample_count} samples")
+        # else:
+        #     print(f"Maximum samples ({self.max_samples}) reached without convergence")
+        
+        return self.sign_conditions, self.C_full_list, self.sample_count, convergence_reached
+    
+    def reset(self):
+        """Reset the sampler state for reuse."""
+        self.sign_conditions = []
+        self.C_full_list = []
+        self.sample_count = 0
+        self.new_sign_count = 0
+        self.convergence_history = []
+    
+    def get_statistics(self):
+        """Get sampling statistics."""
+        unique_sign_conditions = len(set(str(s) for s in self.sign_conditions))
+        discovery_rate = self.new_sign_count / max(self.sample_count, 1)
+        
+        return {
+            'total_samples': self.sample_count,
+            'unique_sign_conditions': unique_sign_conditions,
+            'discovery_rate': discovery_rate,
+            'convergence_reached': self._check_convergence()
+        }

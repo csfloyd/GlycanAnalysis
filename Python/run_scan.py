@@ -35,7 +35,7 @@ output_dir = args.output
 
 n_species = 6
 n_complexes = 7
-n_reactions = 4
+n_reactions = 5
 force_reverse = True
 L = np.array([[2, 1, 1, 0, 0, 0],
               [0, 0, 0, 1, 1, 1]])
@@ -67,6 +67,16 @@ if seed is not None:
 data_logger = NetworkDataLogger()
 profiler = TimeProfiler()
 profiler.start_total_timer()
+
+adaptive_sampler = AdaptiveSampler(
+    min_samples=20,           # Minimum samples before checking convergence
+    max_samples=1000,          # Maximum samples to prevent infinite loops
+    convergence_window=20,    # Window size for convergence check
+    convergence_threshold=0.01, # Stop when <% of recent samples are new
+    timeout_seconds=30,       # Timeout for individual integrations
+    l0_range=(0.0001, 1000.0),
+    profiler=profiler         # Use existing profiler for timing
+)
 
 for iter in range(n_graph_samples):
     seed = np.random.randint(1000000)
@@ -135,70 +145,22 @@ for iter in range(n_graph_samples):
     flexible_reduced_ode_rhs = sim.make_reduced_rhs_with_conservation_flexible()
     profiler.end_timer("flexible_rhs")
  
-    sign_conditions = []    
-    C_full_list = []
-    for n in range(n_sign_samples):
-
-        l0 = np.exp(np.random.uniform(np.log(0.0001), np.log(1000.0), size=L.shape[0]))  # Sample uniformly in log space between 0.1 and 1000
-
-        # Time NNLS
-        profiler.start_timer("nnls")
-        C_full = generate_positive_initial_concentrations_nnls(L, l0)
-        profiler.end_timer("nnls")
-        
-        # Time initial conditions processing
-        profiler.start_timer("initial_conditions")
-        _, C_reduced_init = sim.get_const_and_reduced_init(C_full)
-        profiler.end_timer("initial_conditions")
-
-        # Time ODE integration
-        profiler.start_timer("integration")
-        # Set up timeout for ODE integration (30 seconds)
-        signal.signal(signal.SIGALRM, timeout_handler)
-        try:
-            signal.alarm(5)  # 30 second timeout
-            # Try fast integration first, fall back to standard if needed
-            sol_reduced, C_reduced_final = sim.integrate(
-                lambda C: flexible_reduced_ode_rhs(C, l0), C_reduced_init, t_span=t_span,
-                num_points=num_points, method=int_method, rtol=r_tol, atol=a_tol
-            )
-            signal.alarm(0)   # Cancel timeout
-            profiler.end_timer("integration")
-        except TimeoutError:
-            signal.alarm(0)   # Cancel timeout
-            profiler.end_timer("integration")
-            print(f"  Integration {n} timed out, skipping...")
-            continue
-        except Exception as e:
-            signal.alarm(0)   # Cancel timeout
-            profiler.end_timer("integration")
-            print(f"  Integration {n} failed with error: {e}, skipping...")
-            continue
-
-        try:
-            # Time species recovery
-            profiler.start_timer("species_recovery")
-            C_full = sim.recover_eliminated_species(l0, C_reduced_final)
-            C_full_list.append(C_full)
-            profiler.end_timer("species_recovery")
-            
-            # Time sensitivity analysis
-            profiler.start_timer("sensitivity_analysis")
-            dC_dl = sim.dC_dl_func(C_reduced_final, l0, rates, dR_dC_func, dR_dl_func)
-            dC_dl_full = sim.compute_dC_dk_full(dC_dl)
-            profiler.end_timer("sensitivity_analysis")
-            
-            # Time sign processing
-            profiler.start_timer("sign_processing")
-            signs = np.sign(np.round(dC_dl_full, decimals=12)).tolist()
-            #if signs not in sign_conditions:
-            sign_conditions.append(signs)
-            profiler.end_timer("sign_processing")
-            
-        except Exception as e:
-            profiler.end_timer("sign_processing")
-            print(f"  Sign processing {n} failed with error: {e}, skipping...")
-            continue
+    # Use adaptive sampling instead of fixed sampling
+    profiler.start_timer("adaptive_sampling")
+    sign_conditions, C_full_list, sample_count, convergence_reached = adaptive_sampler.sample_sign_conditions(
+        sim=sim,
+        L=L,
+        t_span=t_span,
+        num_points=num_points,
+        int_method=int_method,
+        r_tol=r_tol,
+        a_tol=a_tol
+    )
+    print(sample_count)
+    profiler.end_timer("adaptive_sampling")
+    
+    # Reset sampler for next network
+    adaptive_sampler.reset()
     
     # Log the network data using the new logger
     profiler.start_timer("data_logging")
@@ -216,7 +178,9 @@ for iter in range(n_graph_samples):
         B_range=B_range,
         F_range=F_range,
         C0=C0,
-        beta=beta
+        beta=beta,
+        sample_count=sample_count,  # Add sampling statistics
+        convergence_reached=convergence_reached
     )
     profiler.end_timer("data_logging")
 
