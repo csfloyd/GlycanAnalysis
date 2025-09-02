@@ -33,45 +33,31 @@ output_dir = args.output
 # subset_group_ind = None
 # seed = 30
 
-# n_species = 6
-# n_complexes = 7
-# n_reactions = 4
-# force_reverse = True
-# L = np.array([[2, 1, 1, 0, 0, 0],
-#               [0, 0, 0, 1, 1, 1]])
-# n_cons = len(L)
-# n_lcs = n_complexes - n_species + n_cons
-# seed = None
-# subset_group_ind = None
-
-n_species = 10
-n_complexes = 11
-n_reactions = 10
+n_species = 6
+n_complexes = 7
+n_reactions = 4
 force_reverse = True
-L = np.array([[2, 1, 1, 0, 0, 0, 0, 0, 0, 0],
-              [0, 0, 0, 2, 1, 1, 0, 0, 0, 0],
-              [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]])
+L = np.array([[2, 1, 1, 0, 0, 0],
+              [0, 0, 0, 1, 1, 1]])
 n_cons = len(L)
 n_lcs = n_complexes - n_species + n_cons
+seed = None
 subset_group_ind = None
 
-
-E_range = 5
-B_range = 5
+E_range = 1
+B_range = 1
 F_range = args.param1
 C0 = 1
 beta = 1
 
-n_graph_samples = 2000
-input_dim = 2
-default_l0 = np.array([1.0, 1.0, 1.0])
-sc_grad_dims = [[6,7,8,9],[0,1]]
+n_graph_samples = 5000
 
-t_span = (0, 100000)
+
+t_span = (0, 10000)
 num_points = 10000
-int_method = 'LSODA'
-r_tol = 1e-10   
-a_tol = 1e-10
+int_method = 'Radau'
+r_tol = 1e-4    
+a_tol = 1e-4
 
 if seed is not None:
     np.random.seed(seed)
@@ -82,32 +68,15 @@ data_logger = NetworkDataLogger()
 profiler = TimeProfiler()
 profiler.start_total_timer()
 
-# ad_len = 50
-# sampler = AdaptiveSampler(
-#     input_dims=[0, 1],
-#     sc_grad_dims=sc_grad_dims,
-#     default_l0=default_l0,
-#     min_samples=ad_len,           # Minimum samples before checking convergence
-#     max_samples=1000,          # Maximum samples to prevent infinite loops
-#     convergence_window=ad_len,    # Window size for convergence check
-#     convergence_threshold=2/ad_len, # Stop when <% of recent samples are new
-#     timeout_seconds=5,       # Timeout for individual integrations
-#     l0_range=(1e-3, 1e3),
-#     profiler=profiler,         # Use existing profiler for timing
-#     round_decimals=6,
-# )
-
-sampler = GridSampler(
-    input_dims=[0, 1],
-    default_l0=default_l0,
-    sc_grad_dims=sc_grad_dims,
-    l0_range=(1e-3, 1e3),
-    l0_grid_size=10,
-    grid_dim=2,
-    timeout_seconds=5,
-    profiler=profiler,
-    round_decimals=6,
-    use_signal_alarms=False
+ad_len = 50
+adaptive_sampler = AdaptiveSampler(
+    min_samples=ad_len,           # Minimum samples before checking convergence
+    max_samples=1000,          # Maximum samples to prevent infinite loops
+    convergence_window=ad_len,    # Window size for convergence check
+    convergence_threshold=2/ad_len, # Stop when <% of recent samples are new
+    timeout_seconds=5,       # Timeout for individual integrations
+    l0_range=(0.0001, 1000.0),
+    profiler=profiler         # Use existing profiler for timing
 )
 
 for iter in range(n_graph_samples):
@@ -132,8 +101,7 @@ for iter in range(n_graph_samples):
 
     # Time conservation group analysis
     profiler.start_timer("conservation_analysis")
-    # M_0t1, M_1t0, M_0b1 = count_conservation_group_changes(r_n)
-    interaction_matrix = get_interaction_matrix(r_n)
+    M_0t1, M_1t0, M_0b1 = count_conservation_group_changes(r_n)
     profiler.end_timer("conservation_analysis")
     
     # Time data storage operations
@@ -161,11 +129,11 @@ for iter in range(n_graph_samples):
     profiler.start_timer("derivatives")
     # Only compute the derivatives we actually use
     dR_dC, dR_dC_func, dR_dl, dR_dl_func, dR_dk, dR_dk_func, remaining_syms = sim.get_first_order_derivatives()
+    profiler.end_timer("derivatives")
+    
     # Store the derivative functions that will be reused in adaptive sampling
     precomputed_derivatives = (dR_dC_func, dR_dl_func)
 
-    profiler.end_timer("derivatives")
-    
     # Time rates creation
     profiler.start_timer("rates_creation")
     rates = np.array([r_n.reactions[r_idx][2] for r_idx in range(len(r_n.reactions))])
@@ -179,7 +147,7 @@ for iter in range(n_graph_samples):
     # Use adaptive sampling instead of fixed sampling
     # Note: The adaptive sampler handles its own internal timing with "adaptive_" prefixed timers
     profiler.start_timer("adaptive_sampling")
-    sign_conditions, C_full_list, dC_dl_list, l0_list, sample_count, convergence_reached = sampler.sample_sign_conditions(
+    sign_conditions, C_full_list, l0_list, sample_count, convergence_reached = adaptive_sampler.sample_sign_conditions(
         sim=sim,
         L=L,
         t_span=t_span,
@@ -192,17 +160,18 @@ for iter in range(n_graph_samples):
     profiler.end_timer("adaptive_sampling")
     
     # Reset sampler for next network
-    sampler.reset()
+    adaptive_sampler.reset()
     
     # Log the network data using the new logger
     profiler.start_timer("data_logging")
     data_logger.log_network(
         r_n=r_n,
-        interaction_matrix=interaction_matrix,
+        M_0t1=M_0t1,
+        M_1t0=M_1t0,
+        M_0b1=M_0b1,
         cycles=cycles,
         sign_conditions=sign_conditions,
         C_full_list=C_full_list,
-        dC_dl_list=dC_dl_list,
         l0_list=l0_list,
         iteration=iter,
         seed=seed,
@@ -220,9 +189,6 @@ for iter in range(n_graph_samples):
         print(f"Iteration {iter} complete")
 
 profiler.end_total_timer()
-
-# Print detailed timing information
-profiler.print_summary()
 
 # Save data using the logger
 data_logger.save_data(output_dir + "/SavedData.pkl")

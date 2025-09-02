@@ -13,6 +13,134 @@ import random
 import time
 import signal
 import pickle
+import itertools
+from scipy.integrate import solve_ivp
+
+def compute_probs(C_full, L_vec, l0):
+    """
+    Compute probabilities from concentrations and conservation laws.
+    
+    Args:
+        C_full: Full concentration array
+        L_vec: Conservation law vector
+        l0: Conservation law constant
+        
+    Returns:
+        Probability array
+    """
+    return (L_vec[:, np.newaxis] * C_full / l0) if C_full.ndim == 2 else (L_vec * C_full / l0)
+
+def get_sign_condition_ids(sign_conditions):
+    # Create a dictionary to store unique sign conditions and their IDs
+    unique_sign_conditions = {}
+    sign_condition_ids = []
+
+    # Assign IDs to each sign condition
+    for sign_condition in sign_conditions:
+        # Convert sign condition to tuple of tuples so it can be used as dict key
+        # Each inner list needs to be converted to tuple to be hashable
+        sign_condition_tuple = tuple(tuple(x) if isinstance(x, list) else x for x in sign_condition)
+        
+        # If we haven't seen this sign condition before, assign it a new ID
+        if sign_condition_tuple not in unique_sign_conditions:
+            unique_sign_conditions[sign_condition_tuple] = len(unique_sign_conditions)
+        
+        # Add the ID to our list
+        sign_condition_ids.append(unique_sign_conditions[sign_condition_tuple])
+
+    return sign_condition_ids
+
+def count_unique_tensors_with_ids(tensor_list, conservative_comparison = False):
+    def are_equal(tensor1, tensor2):
+        """Check if two tensors are equal according to the given criteria."""
+        import numpy as np
+        
+        # Convert to numpy arrays if they aren't already
+        t1 = np.array(tensor1, dtype=float)
+        t2 = np.array(tensor2, dtype=float)
+        
+        # Element-wise multiplication
+        product = t1 * t2
+        
+        # Check if any product is -1 (they disagree at a position where at least one is zero)
+        # Use np.any() explicitly to avoid boolean context issues
+        if not conservative_comparison:
+            # Check if any elements are different (not equal)
+            has_negative_one = np.any(t1 != t2)
+        else:
+            product = t1 * t2
+            has_negative_one = np.any(product == -1)
+        
+        return not has_negative_one
+    
+    def find_representative(tensor, representatives):
+        """Find if tensor is equivalent to any existing representative."""
+        for rep in representatives:
+            if are_equal(tensor, rep):
+                return rep
+        return None
+    
+    # Store unique tensors as lists and their IDs
+    unique_tensors = []
+    tensor_ids = []
+    
+    for tensor in tensor_list:
+        # Check if this tensor is equivalent to any existing unique tensor
+        representative = find_representative(tensor, unique_tensors)
+        
+        if representative is None:
+            # This is a new unique tensor
+            unique_tensors.append(tensor)
+            tensor_ids.append(len(unique_tensors) - 1)
+        else:
+            # This tensor is equivalent to an existing one, use that ID
+            for i, rep in enumerate(unique_tensors):
+                if are_equal(tensor, rep):
+                    tensor_ids.append(i)
+                    break
+    
+    return len(unique_tensors), tensor_ids
+
+def clamp_sign(sign_array, off):
+    result = np.zeros_like(sign_array)
+    result[sign_array > off] = 1
+    result[sign_array < -off] = -1
+    return result
+
+def convert_to_log(data_logger, network_index):
+    dC_dl_list = data_logger.network_data[network_index]['dC_dl_list']
+    C_full_list = data_logger.network_data[network_index]['C_full_list']
+    l0_list = data_logger.network_data[network_index]['l0_list']
+    d_log_C_d_log_l0_list = []
+    for i in range(len(dC_dl_list)):
+        dC_dl_full = dC_dl_list[i]  
+        C_full = C_full_list[i]
+        l0 = l0_list[i]
+        d_log_C_d_log_l0 = np.zeros_like(dC_dl_full)
+        for k in range(dC_dl_full.shape[0]):
+            for l in range(dC_dl_full.shape[1]):
+                d_log_C_d_log_l0[k, l] = dC_dl_full[k, l] * l0[l] / C_full[k]
+        d_log_C_d_log_l0_list.append(d_log_C_d_log_l0)
+
+    return d_log_C_d_log_l0_list
+
+def get_sign_conditions(tensor_list, cut_off):
+    sign_conditions = []
+    for i in range(len(tensor_list)):
+        sign_conditions.append(clamp_sign(tensor_list[i], cut_off).tolist())
+    return sign_conditions
+
+
+def get_n_unique_signs(data_logger, cut_off, conservative_comparison = False, log_scale = False, dims = None):
+    n_unique_signs = []
+    for n in range(len(data_logger.network_data)):
+        data = convert_to_log(data_logger, n) if log_scale else data_logger.network_data[n]['dC_dl_list']
+        if dims is not None:
+            data = [data[i][dims[0], dims[1]] for i in range(len(data))]
+        signs_conditions = get_sign_conditions(data, cut_off)
+        n_unique, tensor_ids = count_unique_tensors_with_ids(signs_conditions, conservative_comparison)
+        n_unique_signs.append(n_unique)
+    return n_unique_signs, tensor_ids
 
 # Timeout handler function
 def timeout_handler(signum, frame):
@@ -23,7 +151,7 @@ class TimeProfiler:
     A class for profiling execution time of different code sections.
     
     This class provides a clean interface for timing various operations
-    and generating summary reports.
+    and generating summary reports. Supports nested timing to avoid double-counting.
     """
     
     def __init__(self):
@@ -31,6 +159,7 @@ class TimeProfiler:
         self.timers = {}
         self.total_start_time = None
         self.total_end_time = None
+        self.active_timer_stack = []  # Stack to track nested timers
         
     def start_total_timer(self):
         """Start the overall timer for the entire process."""
@@ -40,6 +169,10 @@ class TimeProfiler:
         """End the overall timer for the entire process."""
         self.total_end_time = time.time()
         
+        # End any remaining active timers
+        for timer_name in list(self.active_timer_stack):
+            self.end_timer(timer_name)
+        
     def start_timer(self, timer_name: str):
         """Start timing a specific operation.
         
@@ -48,7 +181,18 @@ class TimeProfiler:
         """
         if timer_name not in self.timers:
             self.timers[timer_name] = {'total_time': 0.0, 'start_time': None}
+        
+        # If there's an active timer, pause it before starting the new one
+        if self.active_timer_stack:
+            current_timer = self.active_timer_stack[-1]
+            if self.timers[current_timer]['start_time'] is not None:
+                elapsed_time = time.time() - self.timers[current_timer]['start_time']
+                self.timers[current_timer]['total_time'] += elapsed_time
+                self.timers[current_timer]['start_time'] = None
+        
+        # Start the new timer
         self.timers[timer_name]['start_time'] = time.time()
+        self.active_timer_stack.append(timer_name)
         
     def end_timer(self, timer_name: str):
         """End timing a specific operation and accumulate the time.
@@ -56,10 +200,22 @@ class TimeProfiler:
         Args:
             timer_name: Name of the timer/category to end
         """
-        if timer_name in self.timers and self.timers[timer_name]['start_time'] is not None:
-            elapsed_time = time.time() - self.timers[timer_name]['start_time']
-            self.timers[timer_name]['total_time'] += elapsed_time
-            self.timers[timer_name]['start_time'] = None
+        if timer_name not in self.timers or self.timers[timer_name]['start_time'] is None:
+            return
+            
+        # End the current timer
+        elapsed_time = time.time() - self.timers[timer_name]['start_time']
+        self.timers[timer_name]['total_time'] += elapsed_time
+        self.timers[timer_name]['start_time'] = None
+        
+        # Remove from active stack
+        if timer_name in self.active_timer_stack:
+            self.active_timer_stack.remove(timer_name)
+        
+        # Resume the previous timer if there was one
+        if self.active_timer_stack:
+            previous_timer = self.active_timer_stack[-1]
+            self.timers[previous_timer]['start_time'] = time.time()
             
     def get_timer(self, timer_name: str) -> float:
         """Get the total accumulated time for a specific timer.
@@ -101,17 +257,38 @@ class TimeProfiler:
                               key=lambda x: x[1]['total_time'], 
                               reverse=True)
         
+        # Separate adaptive and non-adaptive timers
+        adaptive_timers = []
+        non_adaptive_timers = []
+        
         for timer_name, timer_data in sorted_timers:
+            if timer_name.startswith("adaptive_") and timer_name != "adaptive_sampling":
+                adaptive_timers.append((timer_name, timer_data))
+            else:
+                non_adaptive_timers.append((timer_name, timer_data))
+
+        # Print adaptive timers under a header
+        if adaptive_timers:
+            print(f"\nAdaptive Sampling Breakdown:")
+            for timer_name, timer_data in adaptive_timers:
+                timer_time = timer_data['total_time']
+                percentage = (timer_time / total_time) * 100
+                print(f"  {timer_name}: {timer_time:.2f} seconds ({percentage:.1f}%)")
+        
+        # Print non-adaptive timers first
+        for timer_name, timer_data in non_adaptive_timers:
             timer_time = timer_data['total_time']
             percentage = (timer_time / total_time) * 100
             print(f"{timer_name}: {timer_time:.2f} seconds ({percentage:.1f}%)")
-            
-        # Calculate "other" time
+        
+        
+        
+        # Calculate "other" time (now should be accurate with nested timing)
         tracked_time = sum(timer_data['total_time'] for timer_data in self.timers.values())
         other_time = total_time - tracked_time
         if other_time > 0:
             other_percentage = (other_time / total_time) * 100
-            print(f"Other operations: {other_time:.2f} seconds ({other_percentage:.1f}%)")
+            print(f"\nOther operations: {other_time:.2f} seconds ({other_percentage:.1f}%)")
             
         print(f"=====================\n")
         
@@ -120,6 +297,7 @@ class TimeProfiler:
         self.timers = {}
         self.total_start_time = None
         self.total_end_time = None
+        self.active_timer_stack = []
         
     def context_manager(self, timer_name: str):
         """Context manager for automatic timing.
@@ -145,22 +323,6 @@ class TimerContext:
         
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.profiler.end_timer(self.timer_name)
-
-
-def compute_probs(C_full, L_vec, l0):
-    """
-    Compute probabilities from concentrations and conservation laws.
-    
-    Args:
-        C_full: Full concentration array
-        L_vec: Conservation law vector
-        l0: Conservation law constant
-        
-    Returns:
-        Probability array
-    """
-    return (L_vec[:, np.newaxis] * C_full / l0) if C_full.ndim == 2 else (L_vec * C_full / l0)
-
 
 
 @dataclass
@@ -234,12 +396,11 @@ class NetworkDataLogger:
         
     def log_network(self, 
                    r_n, 
-                   M_0t1, 
-                   M_1t0, 
-                   M_0b1, 
+                   interaction_matrix, 
                    cycles, 
                    sign_conditions,
                    C_full_list,
+                   l0_list,
                    iteration: int = None,
                    seed: int = None,
                    **kwargs):
@@ -255,25 +416,25 @@ class NetworkDataLogger:
             'complexes_per_class': r_n.complexes_per_class,
             'reactions_per_class': r_n.reactions_per_class,
             'force_reverse': r_n.force_reverse,
-            'subset_group_ind': r_n.subset_group_ind
+            'subset_group_ind': r_n.subset_group_ind,
+            'reaction_strings': r_n.get_reaction_strings_simple(include_reverse=False),
+            'species_names': r_n.species_names,
+            'seed': r_n.seed
         }
         
         # Create data entry
         data_entry = {
             'network_params': network_params,
-            'conservation_changes': {
-                'M_0t1': M_0t1,
-                'M_1t0': M_1t0,
-                'M_0b1': M_0b1
-            },
+            'interaction_matrix': interaction_matrix,
             'cycles': cycles,
             'n_cycles': len(cycles[1]),
             'sign_conditions': sign_conditions,
             'n_sign_conditions': len(set(str(s) for s in sign_conditions)),
             'C_full_list': C_full_list,
+            'l0_list': l0_list,
             'iteration': iteration,
             'seed': seed,
-            'additional_data': kwargs
+            **kwargs
         }
         
         self.network_data.append(data_entry)
@@ -326,6 +487,51 @@ class NetworkDataLogger:
     def clear_data(self):
         """Clear all logged data."""
         self.network_data = []
+    
+    def reconstruct_network(self, index: int, random_rates: bool = True):
+        """
+        Reconstruct a ReactionNetwork instance using reaction strings.
+        This uses the from_reaction_strings constructor.
+        
+        Args:
+            index: Index of the network to reconstruct
+            random_rates: Whether to assign random rates (True) or preserve original rates (False)
+            
+        Returns:
+            ReactionNetwork instance
+            
+        Raises:
+            IndexError: If index is out of range
+            ImportError: If ReactionNetwork class is not available
+            KeyError: If reaction_strings not found in network_params
+        """
+        try:
+            from CRNs.reaction_network import ReactionNetwork
+        except ImportError:
+            raise ImportError("ReactionNetwork class not available. Make sure CRNs.reaction_network is importable.")
+        
+        if 0 <= index < len(self.network_data):
+            network_params = self.network_data[index]['network_params']
+            
+            if 'reaction_strings' not in network_params:
+                raise KeyError("reaction_strings not found in network_params. Make sure to log networks with reaction strings.")
+            
+            reaction_strings = network_params['reaction_strings']
+            L = network_params['L']
+            seed = network_params.get('seed', 42)
+            force_reverse = network_params.get('force_reverse', True)
+            subset_group_ind = network_params.get('subset_group_ind')
+            species_names = network_params.get('species_names')
+            rates = [r[2] for r in network_params.get('reactions')]
+            r_n = ReactionNetwork.from_reaction_strings(
+                reaction_strings, L, seed, force_reverse, subset_group_ind, 
+                random_rates, species_names
+            )
+            r_n.update_rates(rates)
+            
+            return r_n
+        else:
+            raise IndexError(f"Network index {index} out of range (0-{len(self.network_data)-1})")
 
 class AdaptiveSampler:
     """
@@ -336,23 +542,34 @@ class AdaptiveSampler:
     """
     
     def __init__(self, 
+                 input_dims: List[int],
+                 default_l0: np.ndarray,
+                 sc_grad_dims: List[List[int]] = None,
                  min_samples: int = 20,
                  max_samples: int = 1000,
                  convergence_window: int = 20,
                  convergence_threshold: float = 0.02,
                  timeout_seconds: int = 30,
                  l0_range: tuple = (0.0001, 1000.0),
-                 profiler: TimeProfiler = None):
+                 profiler: TimeProfiler = None,
+                 round_decimals: int = 3,
+                 use_signal_alarms: bool = True):
         """
         Initialize the adaptive sampler.
         
         Args:
+            input_dims: Array of dimensions of l0 from which to sample new values randomly
+            default_l0: Default l0 values for dimensions not in input_dims
+            sc_grad_dims: List of [rows, columns] specifying which dimensions of dC_dl_func to use for sign conditions
             min_samples: Minimum number of samples before checking convergence
             max_samples: Maximum number of samples to prevent infinite loops
             convergence_window: Number of recent samples to check for convergence
             convergence_threshold: Fraction of new sign conditions below which to stop
             timeout_seconds: Timeout for individual sample generation
+            l0_range: Range for sampling l0 values
             profiler: Optional TimeProfiler instance for timing
+            round_decimals: Number of decimal places for rounding
+            use_signal_alarms: Whether to use signal alarms for timeout handling
         """
         self.min_samples = min_samples
         self.max_samples = max_samples
@@ -361,13 +578,19 @@ class AdaptiveSampler:
         self.timeout_seconds = timeout_seconds
         self.profiler = profiler
         self.l0_range = l0_range
+        self.round_decimals = round_decimals
+        self.use_signal_alarms = use_signal_alarms
+        self.input_dims = input_dims
+        self.default_l0 = np.array(default_l0)  # Ensure it's a numpy array
+        self.sc_grad_dims = sc_grad_dims
         # Sampling state
         self.sign_conditions = []
         self.C_full_list = []
+        self.dC_dl_list = []
         self.sample_count = 0
         self.new_sign_count = 0
         self.convergence_history = []
-        
+        self.l0_list = []
     def _check_convergence(self) -> bool:
         """
         Check if sampling has converged based on recent discovery rate.
@@ -388,7 +611,7 @@ class AdaptiveSampler:
             
         return False
     
-    def _get_sign_sample(self, sim, L, t_span, num_points, int_method, r_tol, a_tol):
+    def _get_sign_sample(self, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
         """
         Generate a single sign sample with all necessary computations.
         
@@ -400,34 +623,40 @@ class AdaptiveSampler:
             int_method: Integration method
             r_tol: Relative tolerance
             a_tol: Absolute tolerance
+            precomputed_derivatives: Precomputed derivative functions (dR_dC_func, dR_dl_func, etc.)
             
         Returns:
             tuple: (signs, C_full, success) where success is boolean
         """
         try:
             # Sample initial conditions
-            l0 = np.exp(np.random.uniform(np.log(self.l0_range[0]), np.log(self.l0_range[1]), size=L.shape[0]))
             
+            l0 = self.default_l0.copy()
+            # Sample only the specified input dimensions
+            for dim in self.input_dims:
+                l0[dim] = np.exp(np.random.uniform(np.log(self.l0_range[0]), np.log(self.l0_range[1])))
+        
             if self.profiler:
-                self.profiler.start_timer("nnls")
+                self.profiler.start_timer("adaptive_nnls")
             
             # Generate initial concentrations
             C_full = generate_positive_initial_concentrations_nnls(L, l0)
             
             if self.profiler:
-                self.profiler.end_timer("nnls")
-                self.profiler.start_timer("initial_conditions")
+                self.profiler.end_timer("adaptive_nnls")
+                self.profiler.start_timer("adaptive_initial_conditions")
             
             # Get reduced initial conditions
             _, C_reduced_init = sim.get_const_and_reduced_init(C_full)
             
             if self.profiler:
-                self.profiler.end_timer("initial_conditions")
-                self.profiler.start_timer("integration")
+                self.profiler.end_timer("adaptive_initial_conditions")
+                self.profiler.start_timer("adaptive_integration")
             
             # Set up timeout for integration
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(self.timeout_seconds)
+            if self.use_signal_alarms:
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(self.timeout_seconds)
             
             try:
                 # Create flexible RHS function
@@ -444,54 +673,64 @@ class AdaptiveSampler:
                     atol=a_tol
                 )
                 
-                signal.alarm(0)  # Cancel timeout
+                if self.use_signal_alarms:
+                    signal.alarm(0)  # Cancel timeout
                 
                 if self.profiler:
-                    self.profiler.end_timer("integration")
-                    self.profiler.start_timer("species_recovery")
+                    self.profiler.end_timer("adaptive_integration")
+                    self.profiler.start_timer("adaptive_species_recovery")
                 
                 # Recover full species concentrations
                 C_full = sim.recover_eliminated_species(l0, C_reduced_final)
                 
                 if self.profiler:
-                    self.profiler.end_timer("species_recovery")
-                    self.profiler.start_timer("sensitivity_analysis")
+                    self.profiler.end_timer("adaptive_species_recovery")
+                    self.profiler.start_timer("adaptive_sensitivity_analysis")
                 
-                # Compute sensitivity derivatives
+                # Compute sensitivity derivatives (use precomputed if available)
                 rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
-                dR_dC, dR_dC_func, dR_dl, dR_dl_func, dR_dk, dR_dk_func, _ = sim.get_first_order_derivatives()
+                
+                dR_dC_func, dR_dl_func = precomputed_derivatives
                 
                 dC_dl = sim.dC_dl_func(C_reduced_final, l0, rates, dR_dC_func, dR_dl_func)
-                dC_dl_full = sim.compute_dC_dk_full(dC_dl)
+                dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool = True)
                 
                 if self.profiler:
-                    self.profiler.end_timer("sensitivity_analysis")
-                    self.profiler.start_timer("sign_processing")
+                    self.profiler.end_timer("adaptive_sensitivity_analysis")
+                    self.profiler.start_timer("adaptive_sign_processing")
                 
                 # Extract sign conditions
-                signs = np.sign(np.round(dC_dl_full, decimals=12)).tolist()
+                if self.sc_grad_dims is not None:
+                    # Use only specified dimensions of dC_dl_full
+                    rows, cols = self.sc_grad_dims
+                    dC_dl_subset = dC_dl_full[np.ix_(rows, cols)]
+                    signs = np.sign(np.round(dC_dl_subset, decimals=self.round_decimals)).tolist()
+                else:
+                    # Use all dimensions (original behavior)
+                    signs = np.sign(np.round(dC_dl_full, decimals=self.round_decimals)).tolist()
                 
                 if self.profiler:
-                    self.profiler.end_timer("sign_processing")
+                    self.profiler.end_timer("adaptive_sign_processing")
                 
-                return signs, C_full, True
+                return signs, C_full, dC_dl_full, l0, True
                 
             except TimeoutError:
-                signal.alarm(0)  # Cancel timeout
+                if self.use_signal_alarms:
+                    signal.alarm(0)  # Cancel timeout
                 if self.profiler:
-                    self.profiler.end_timer("integration")
-                return None, None, False
+                    self.profiler.end_timer("adaptive_integration")
+                return None, None, None, None, False
                 
         except Exception as e:
             print(e)
             if self.profiler:
                 # End any active timers
-                for timer_name in ["nnls", "initial_conditions", "integration", "species_recovery", "sensitivity_analysis", "sign_processing"]:
+                for timer_name in ["adaptive_nnls", "adaptive_initial_conditions", "adaptive_integration", "adaptive_species_recovery", "adaptive_sensitivity_analysis", "adaptive_sign_processing"]:
                     if timer_name in self.profiler.timers and self.profiler.timers[timer_name]['start_time'] is not None:
                         self.profiler.end_timer(timer_name)
-            return None, None, False
+            return None, None, None, None, False
     
-    def sample_sign_conditions(self, sim, L, t_span, num_points, int_method, r_tol, a_tol):
+    def sample_sign_conditions(self, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
         """
         Perform adaptive sampling of sign conditions.
         
@@ -503,6 +742,7 @@ class AdaptiveSampler:
             int_method: Integration method
             r_tol: Relative tolerance
             a_tol: Absolute tolerance
+            precomputed_derivatives: Precomputed derivative functions (dR_dC_func, dR_dl_func, etc.)
             
         Returns:
             tuple: (sign_conditions, C_full_list, sample_count, convergence_reached)
@@ -510,16 +750,14 @@ class AdaptiveSampler:
         # print(f"Starting adaptive sampling (min: {self.min_samples}, max: {self.max_samples})")
         
         while not self._check_convergence():
-            self.sample_count += 1
-            
-            # if self.sample_count % 10 == 0:
-            #     print(f"  Sample {self.sample_count}, unique sign conditions: {len(set(str(s) for s in self.sign_conditions))}")
             
             # Generate sign sample
-            signs, C_full, success = self._get_sign_sample(sim, L, t_span, num_points, int_method, r_tol, a_tol)
+            signs, C_full, dC_dl_full, l0, success = self._get_sign_sample(sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives)
             
             if not success:
                 continue
+
+            self.sample_count += 1
             
             # Check if this is a new sign condition
             signs_str = str(signs)
@@ -533,24 +771,22 @@ class AdaptiveSampler:
             self.convergence_history.append(1 if is_new else 0)
             if is_new:
                 self.new_sign_count += 1
-                self.sign_conditions.append(signs)
-                self.C_full_list.append(C_full)
+
+            self.sign_conditions.append(signs)
+            self.C_full_list.append(C_full)
+            self.dC_dl_list.append(dC_dl_full)
+            self.l0_list.append(l0)
         
         convergence_reached = self._check_convergence()
-        unique_sign_conditions = len(set(str(s) for s in self.sign_conditions))
         
-        # print(f"Sampling complete: {self.sample_count} samples, {unique_sign_conditions} unique sign conditions")
-        # if convergence_reached:
-        #     print(f"Convergence reached after {self.sample_count} samples")
-        # else:
-        #     print(f"Maximum samples ({self.max_samples}) reached without convergence")
-        
-        return self.sign_conditions, self.C_full_list, self.sample_count, convergence_reached
+        return self.sign_conditions, self.C_full_list, self.dC_dl_list, self.l0_list, self.sample_count, convergence_reached
     
     def reset(self):
         """Reset the sampler state for reuse."""
         self.sign_conditions = []
         self.C_full_list = []
+        self.dC_dl_list = []
+        self.l0_list = []
         self.sample_count = 0
         self.new_sign_count = 0
         self.convergence_history = []
@@ -565,4 +801,357 @@ class AdaptiveSampler:
             'unique_sign_conditions': unique_sign_conditions,
             'discovery_rate': discovery_rate,
             'convergence_reached': self._check_convergence()
+        }
+    
+class GridSampler:
+    """
+    Grid sampler for sign conditions.
+    
+    This class implements grid sampling of sign conditions.
+    """
+    
+    def __init__(self, 
+                 input_dims: List[int],
+                 default_l0: np.ndarray,
+                 sc_grad_dims: List[List[int]] = None,
+                 l0_range: tuple = (0.0001, 1000.0),
+                 l0_grid_size: int = 10,
+                 grid_dim: int = 2,
+                 timeout_seconds: int = 30,
+                 profiler: TimeProfiler = None,
+                 round_decimals: int = 3,
+                 use_signal_alarms: bool = True):
+        """
+        Initialize the grid sampler.
+        
+        Args:
+            input_dims: Array of dimensions of l0 from which to sample new values randomly
+            default_l0: Default l0 values for dimensions not in input_dims
+            sc_grad_dims: List of [rows, columns] specifying which dimensions of dC_dl_func to use for sign conditions
+            l0_range: Range for sampling l0 values
+            l0_grid_size: Size of the grid for l0 values
+            grid_dim: Dimension of the grid
+            timeout_seconds: Timeout for individual sample generation
+            profiler: Optional TimeProfiler instance for timing
+            round_decimals: Number of decimal places for rounding
+            use_signal_alarms: Whether to use signal alarms for timeout handling
+        """
+        self.l0_range = l0_range
+        self.l0_grid_size = l0_grid_size
+        self.profiler = profiler
+        self.l0_grid = np.logspace(np.log10(l0_range[0]), np.log10(l0_range[1]), l0_grid_size)
+        self.grid_dim = grid_dim
+        self.timeout_seconds = timeout_seconds
+        self.round_decimals = round_decimals
+        self.use_signal_alarms = use_signal_alarms
+        self.input_dims = input_dims
+        self.default_l0 = np.array(default_l0)  # Ensure it's a numpy array
+        self.sc_grad_dims = sc_grad_dims
+        # Sampling state
+        self.sign_conditions = []
+        self.C_full_list = []
+        self.dC_dl_list = []
+        self.sample_count = 0
+        self.new_sign_count = 0
+        self.convergence_history = []
+        self.l0_list = []
+    
+    def _get_sign_sample(self, l0, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
+        """
+        Generate a single sign sample with all necessary computations.
+        
+        Args:
+            sim: ReactionNetworkSimulator instance
+            L: Conservation law matrix
+            t_span: Integration time span
+            num_points: Number of integration points
+            int_method: Integration method
+            r_tol: Relative tolerance
+            a_tol: Absolute tolerance
+            precomputed_derivatives: Precomputed derivative functions (dR_dC_func, dR_dl_func, etc.)
+            
+        Returns:
+            tuple: (signs, C_full, success) where success is boolean
+        """
+        try:
+            
+            if self.profiler:
+                self.profiler.start_timer("adaptive_nnls")
+            
+            # Generate initial concentrations
+            C_full = generate_positive_initial_concentrations_nnls(L, l0)
+            
+            if self.profiler:
+                self.profiler.end_timer("adaptive_nnls")
+                self.profiler.start_timer("adaptive_initial_conditions")
+            
+            # Get reduced initial conditions
+            _, C_reduced_init = sim.get_const_and_reduced_init(C_full)
+            
+            if self.profiler:
+                self.profiler.end_timer("adaptive_initial_conditions")
+                self.profiler.start_timer("adaptive_integration")
+            
+            # Set up timeout for integration
+            if self.use_signal_alarms:
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(self.timeout_seconds)
+            
+            try:
+                # Create flexible RHS function
+                flexible_reduced_ode_rhs = sim.make_reduced_rhs_with_conservation_flexible()
+                
+                # Integrate ODE
+                sol_reduced, C_reduced_final = sim.integrate(
+                    lambda C: flexible_reduced_ode_rhs(C, l0), 
+                    C_reduced_init, 
+                    t_span=t_span,
+                    num_points=num_points, 
+                    method=int_method, 
+                    rtol=r_tol, 
+                    atol=a_tol
+                )
+                
+                if self.use_signal_alarms:
+                    signal.alarm(0)  # Cancel timeout
+                
+                if self.profiler:
+                    self.profiler.end_timer("adaptive_integration")
+                    self.profiler.start_timer("adaptive_species_recovery")
+                
+                # Recover full species concentrations
+                C_full = sim.recover_eliminated_species(l0, C_reduced_final)
+                
+                if self.profiler:
+                    self.profiler.end_timer("adaptive_species_recovery")
+                    self.profiler.start_timer("adaptive_sensitivity_analysis")
+                
+                # Compute sensitivity derivatives (use precomputed if available)
+                rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
+                
+                dR_dC_func, dR_dl_func = precomputed_derivatives
+                
+                dC_dl = sim.dC_dl_func(C_reduced_final, l0, rates, dR_dC_func, dR_dl_func)
+                dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool = True)
+                
+                if self.profiler:
+                    self.profiler.end_timer("adaptive_sensitivity_analysis")
+                    self.profiler.start_timer("adaptive_sign_processing")
+                
+                # Extract sign conditions
+                if self.sc_grad_dims is not None:
+                    # Use only specified dimensions of dC_dl_full
+                    rows, cols = self.sc_grad_dims
+                    dC_dl_subset = dC_dl_full[np.ix_(rows, cols)]
+                    signs = np.sign(np.round(dC_dl_subset, decimals=self.round_decimals)).tolist()
+                else:
+                    # Use all dimensions (original behavior)
+                    signs = np.sign(np.round(dC_dl_full, decimals=self.round_decimals)).tolist()
+                
+                if self.profiler:
+                    self.profiler.end_timer("adaptive_sign_processing")
+                
+                return signs, C_full, dC_dl_full, l0, True
+                
+            except TimeoutError:
+                if self.use_signal_alarms:
+                    signal.alarm(0)  # Cancel timeout
+                if self.profiler:
+                    self.profiler.end_timer("adaptive_integration")
+                return None, None, None, None, False
+                
+        except Exception as e:
+            print(e)
+            if self.profiler:
+                # End any active timers
+                for timer_name in ["adaptive_nnls", "adaptive_initial_conditions", "adaptive_integration", "adaptive_species_recovery", "adaptive_sensitivity_analysis", "adaptive_sign_processing"]:
+                    if timer_name in self.profiler.timers and self.profiler.timers[timer_name]['start_time'] is not None:
+                        self.profiler.end_timer(timer_name)
+            return None, None, None, None, False
+        
+    # def _get_sign_sample_contour(self, l0_init, C_reduced_init, l0, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
+    #     """
+    #     Generate a single sign sample with all necessary computations.
+        
+    #     Args:
+    #         sim: ReactionNetworkSimulator instance
+    #         L: Conservation law matrix
+    #         t_span: Integration time span
+    #         num_points: Number of integration points
+    #         int_method: Integration method
+    #         r_tol: Relative tolerance
+    #         a_tol: Absolute tolerance
+    #         precomputed_derivatives: Precomputed derivative functions (dR_dC_func, dR_dl_func, etc.)
+            
+    #     Returns:
+    #         tuple: (signs, C_full, success) where success is boolean
+    #     """
+    #     try:
+            
+    #         if self.profiler:
+    #             self.profiler.start_timer("adaptive_nnls")
+            
+    #         l0_vec = l0 - l0_init
+    #         l0_norm = np.linalg.norm(l0_vec)
+    #         l0_unit_vec = l0_vec / l0_norm
+            
+    #         if self.profiler:
+    #             self.profiler.end_timer("adaptive_nnls")
+    #             self.profiler.start_timer("adaptive_integration")
+            
+            
+    #         # Set up timeout for integration
+    #         if self.use_signal_alarms:
+    #             signal.signal(signal.SIGALRM, timeout_handler)
+    #             signal.alarm(self.timeout_seconds)
+
+    #         dR_dC_func, dR_dl_func = precomputed_derivatives
+    #         rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
+
+    #         def ode_func(t, C):
+    #             return sim.dC_func(
+    #                 t, C,
+    #                 rates,
+    #                 l0_unit_vec,
+    #                 l0_init,
+    #                 dR_dC_func,
+    #                 dR_dl_func
+    #             )
+
+            
+    #         try:
+    #             sol = solve_ivp(
+    #             ode_func,
+    #             t_span=(0, l0_norm),
+    #             y0=C_reduced_init,
+    #             method=int_method, 
+    #             rtol=r_tol,
+    #             atol=a_tol
+    #             )
+                
+    #             if self.use_signal_alarms:
+    #                 signal.alarm(0)  # Cancel timeout
+                
+    #             if self.profiler:
+    #                 self.profiler.end_timer("adaptive_integration")
+    #                 self.profiler.start_timer("adaptive_species_recovery")
+                
+    #             C_reduced_final = sol.y[:, -1]
+
+    #             # Recover full species concentrations
+    #             C_full = sim.recover_eliminated_species(l0, C_reduced_final)
+                
+    #             if self.profiler:
+    #                 self.profiler.end_timer("adaptive_species_recovery")
+    #                 self.profiler.start_timer("adaptive_sensitivity_analysis")
+                
+    #             # Compute sensitivity derivatives (use precomputed if available)
+    #             rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
+                
+                
+    #             dC_dl = sim.dC_dl_func(C_reduced_final, l0, rates, dR_dC_func, dR_dl_func)
+    #             dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool = True)
+                
+    #             if self.profiler:
+    #                 self.profiler.end_timer("adaptive_sensitivity_analysis")
+    #                 self.profiler.start_timer("adaptive_sign_processing")
+                
+    #             # Extract sign conditions
+    #             if self.sc_grad_dims is not None:
+    #                 # Use only specified dimensions of dC_dl_full
+    #                 rows, cols = self.sc_grad_dims
+    #                 dC_dl_subset = dC_dl_full[np.ix_(rows, cols)]
+    #                 signs = np.sign(np.round(dC_dl_subset, decimals=self.round_decimals)).tolist()
+    #             else:
+    #                 # Use all dimensions (original behavior)
+    #                 signs = np.sign(np.round(dC_dl_full, decimals=self.round_decimals)).tolist()
+                
+    #             if self.profiler:
+    #                 self.profiler.end_timer("adaptive_sign_processing")
+                
+    #             return signs, C_full, l0, True
+                
+    #         except TimeoutError:
+    #             if self.use_signal_alarms:
+    #                 signal.alarm(0)  # Cancel timeout
+    #             if self.profiler:
+    #                 self.profiler.end_timer("adaptive_integration")
+    #             return None, None, None, False
+                
+    #     except Exception as e:
+    #         print(e)
+    #         if self.profiler:
+    #             # End any active timers
+    #             for timer_name in ["adaptive_nnls", "adaptive_initial_conditions", "adaptive_integration", "adaptive_species_recovery", "adaptive_sensitivity_analysis", "adaptive_sign_processing"]:
+    #                 if timer_name in self.profiler.timers and self.profiler.timers[timer_name]['start_time'] is not None:
+    #                     self.profiler.end_timer(timer_name)
+    #         return None, None, None, False
+    
+    def sample_sign_conditions(self, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
+        """
+        Perform grid sampling of sign conditions over specified input dimensions.
+        
+        Args:
+            sim: ReactionNetworkSimulator instance
+            L: Conservation law matrix
+            t_span: Integration time span
+            num_points: Number of integration points
+            int_method: Integration method
+            r_tol: Relative tolerance
+            a_tol: Absolute tolerance
+            precomputed_derivatives: Precomputed derivative functions (dR_dC_func, dR_dl_func, etc.)
+            
+        Returns:
+            tuple: (sign_conditions, C_full_list, dC_dl_list, l0_list, sample_count, convergence_reached)
+        """
+        
+        # Create grid over the specified input dimensions
+        l0_grid_iter = itertools.product(*[self.l0_grid] * len(self.input_dims))
+        
+        for l0_grid_vals in l0_grid_iter:
+            # Start with default values for all dimensions
+            l0 = self.default_l0.copy()
+            
+            # Set grid values for the specified input dimensions
+            for i, dim in enumerate(self.input_dims):
+                l0[dim] = l0_grid_vals[i]
+            
+            # Generate sign sample
+            signs, C_full, dC_dl_full, l0, success = self._get_sign_sample(l0, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives)
+            
+            if not success:
+                continue
+
+            self.sample_count += 1
+            
+            # # Check if this is a new sign condition
+            # signs_str = str(signs)
+            # is_new = True
+            # for existing_signs in self.sign_conditions:
+            #     if str(existing_signs) == signs_str:
+            #         is_new = False
+            #         break
+
+            self.sign_conditions.append(signs)
+            self.C_full_list.append(C_full)
+            self.dC_dl_list.append(dC_dl_full)
+            self.l0_list.append(l0)
+        
+        return self.sign_conditions, self.C_full_list, self.dC_dl_list, self.l0_list, self.sample_count, True
+    
+    def reset(self):
+        """Reset the sampler state for reuse."""
+        self.sign_conditions = []
+        self.C_full_list = []
+        self.dC_dl_list = []
+        self.l0_list = []
+        self.sample_count = 0
+    
+    def get_statistics(self):
+        """Get sampling statistics."""
+        unique_sign_conditions = len(set(str(s) for s in self.sign_conditions))
+        
+        return {
+            'total_samples': self.sample_count,
+            'unique_sign_conditions': unique_sign_conditions
         }

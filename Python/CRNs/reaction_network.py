@@ -130,6 +130,8 @@ class ReactionNetwork:
             # This means all 'n_tries' attempts failed.
             raise ValueError(f"Could not find a valid reaction network with the specified parameters after {self.n_tries} attempts.")
 
+
+
     @classmethod
     def from_reaction_strings(cls, reaction_strings: List[str], L: np.ndarray,
                              seed: int = 42, force_reverse: bool = True, 
@@ -210,11 +212,11 @@ class ReactionNetwork:
         instance.n_species = n_species
         instance.n_complexes = len(instance.all_complexes)
         instance.n_reactions = len(instance.reactions)
-        instance.n_lcs = len(instance.linkage_groups)
         
         # Set linkage groups and assignments (simplified for deterministic case)
         instance.linkage_groups = instance._build_linkage_groups(reactions)
         instance.assignments = instance._build_assignments()
+        instance.n_lcs = len(instance.linkage_groups)
         
         # Compute and store complexes_per_class and reactions_per_class
         instance.complexes_per_class, instance.reactions_per_class = instance._compute_complexes_and_reactions_per_class()
@@ -903,6 +905,46 @@ class ReactionNetwork:
             else:
                 reaction_strings.append(f"r{r_idx}: {src} -> {dst}")
         return reaction_strings
+    
+    def get_reaction_strings_simple(self, include_reverse: bool = False) -> List[str]:
+        """
+        Returns a list of simple reaction strings without rates or indices.
+        These can be used to reconstruct the network using from_reaction_strings.
+        
+        Args:
+            include_reverse: If True, includes reverse reactions. If False, only includes
+                           unique reactions to avoid duplicates when force_reverse=True.
+        
+        Example: ["A+B->C", "C->D+E"]
+        
+        Returns:
+            List of simple reaction strings
+        """
+        reaction_strings = []
+        seen_reactions = set()
+        
+        for i, j, _ in self.reactions:
+            src = self.all_complexes[i]
+            dst = self.all_complexes[j]
+            reaction_str = f"{src}->{dst}"
+            reverse_str = f"{dst}->{src}"
+            
+            if include_reverse:
+                # Include all reactions (both forward and reverse)
+                reaction_strings.append(reaction_str)
+            else:
+                # For reversible networks, only add each unique reaction once
+                if self.force_reverse:
+                    # Check if we've already seen this reaction or its reverse
+                    if reaction_str not in seen_reactions and reverse_str not in seen_reactions:
+                        reaction_strings.append(reaction_str)
+                        seen_reactions.add(reaction_str)
+                        seen_reactions.add(reverse_str)
+                else:
+                    # For irreversible networks, add all reactions
+                    reaction_strings.append(reaction_str)
+        
+        return reaction_strings
 
     def print_reactions(self, include_rates: bool = True) -> None:
         """
@@ -931,6 +973,10 @@ class ReactionNetwork:
 
         self.reactions = [(i, j, new_rate) for (i, j, _), new_rate in zip(self.reactions, new_rates)]
         self.A = self._build_A_matrix_incidence()
+
+    def get_rates(self):
+        """Get the reaction rates"""
+        return [r[2] for r in self.reactions]
 
     
     

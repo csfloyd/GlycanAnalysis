@@ -52,6 +52,42 @@ def count_conservation_group_changes(r_n):
 
     return M_0t1, M_1t0, M_0b1
 
+def find_sublists_containing_element(big_list, target_element):
+    """Return indices of sublists containing the target element."""
+    return [i for i, sublist in enumerate(big_list) if target_element in sublist]
+
+def get_interaction_matrix(r_n):
+    # Get conservation groups
+    conservation_groups = r_n.get_conservation_groups()
+    interaction_matrix = np.zeros((len(conservation_groups), len(conservation_groups)))
+    S = r_n.get_stoichiometric_matrix()
+    species_names = r_n.species_names
+
+    # Loop through reactions and check conservation group membership
+    for i, (cr_idx, cp_idx, _) in enumerate(r_n.reactions):
+        cr = r_n.all_complexes[cr_idx]
+        cp = r_n.all_complexes[cp_idx]
+
+        cr_species = cr.split('+') if len(cr)==3 else [cr]
+        cp_species = cp.split('+') if len(cp)==3 else [cp]
+        #print(cr_species, cp_species)
+
+        # Get species involved (non-zero elements)
+        stoich_change_speices = [species_names[j] for j in range(len(species_names)) if S[j,i] != 0]
+        lhs_species = cr_species 
+
+        up_stream_indices = list(set().union(*[find_sublists_containing_element(conservation_groups, lhs) for lhs in lhs_species]))
+        down_stream_indices = list(set().union(*[find_sublists_containing_element(conservation_groups, stoich) for stoich in stoich_change_speices]))
+
+        # print(up_stream_indices, down_stream_indices)
+
+        for k in up_stream_indices:
+            for l in down_stream_indices:
+                if k != l:
+                    interaction_matrix[k,l] += 1
+
+    return interaction_matrix
+
 def compute_cycles(r_n):
         """
         Compute cycles in the reaction network by finding the nullspace of the stoichiometric matrix.

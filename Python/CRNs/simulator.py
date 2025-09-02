@@ -427,6 +427,50 @@ class ReactionNetworkSimulator:
         
         return dR_dC_dk, dR_dC_dk_func, dR_dl_dk, dR_dl_dk_func
 
+    def get_hessian_derivatives(self, dR_dC=None):
+        """
+        Returns second-order derivatives (Hessian) with respect to concentrations.
+        
+        Args:
+            dR_dC: First-order derivative w.r.t. species (optional, computed if not provided)
+            
+        Returns:
+            dR_dC_dC, dR_dC_dC_func: Hessian w.r.t. species (2nd derivative)
+        """
+        if dR_dC is None:
+            # Get first-order derivatives if not provided
+            _, _, _, _, _, _, remaining_syms = self.get_first_order_derivatives()
+            reduced_rhs, remaining_syms, const_syms, rate_syms = self.get_symbolic_reduced_rhs()
+            dR_dC = sympy.Matrix(reduced_rhs).jacobian(remaining_syms)
+        else:
+            _, remaining_syms, const_syms, rate_syms = self.get_symbolic_reduced_rhs()
+        
+        arg_syms = list(remaining_syms) + list(const_syms) + list(rate_syms)
+        
+        # Helper function for tensor evaluation
+        def evaluate_tensor_func(func_array, *args):
+            out = np.empty(func_array.shape, dtype=float)
+            it = np.nditer(func_array, flags=['multi_index', 'refs_ok'])
+            for x in it:
+                idx = it.multi_index
+                out[idx] = func_array[idx](*args)
+            return out
+
+        # dR_dC_dC: (m, n, n) - Hessian with respect to concentrations
+        m, n = dR_dC.shape
+        dR_dC_dC = sympy.MutableDenseNDimArray(
+            [[[dR_dC[i, j].diff(remaining_syms[k]) for k in range(n)] for j in range(n)] for i in range(m)]
+        )
+        dR_dC_dC_func_array = np.empty((m, n, n), dtype=object)
+        for i in range(m):
+            for j in range(n):
+                for k in range(n):
+                    dR_dC_dC_func_array[i, j, k] = sympy.lambdify(arg_syms, dR_dC_dC[i, j, k], modules='numpy')
+        def dR_dC_dC_func(*args):
+            return evaluate_tensor_func(dR_dC_dC_func_array, *args)
+        
+        return dR_dC_dC, dR_dC_dC_func
+
     def get_derivatives(self):
         """
         Returns symbolic and lambdified derivatives of the reduced ODE system with respect to remaining species, conservation constants, and rate constants.
@@ -526,7 +570,7 @@ class ReactionNetworkSimulator:
         dC_dk = dC_combined[len(self.remaining_species):].reshape(len(self.remaining_species), -1)
         return dC, dC_dk
     
-    def compute_dC_dk_full(self, dC_dk):
+    def compute_dC_dk_full(self, dC_dk, l_bool = False):
         """
         Computes the full dC_dk matrix including both eliminated and remaining species.
         
@@ -554,6 +598,8 @@ class ReactionNetworkSimulator:
             if sp in eliminated_species:
                 # Get index in eliminated species list to find corresponding dsp_dk
                 idx = eliminated_species.index(sp)
+                if l_bool:
+                    dsp_dk_list[idx][idx] += 1.0
                 new_dC_dk.append(dsp_dk_list[idx])
             else:
                 # Get index in remaining species list to find corresponding dC_dk
