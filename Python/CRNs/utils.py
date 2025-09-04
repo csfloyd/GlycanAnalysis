@@ -131,16 +131,36 @@ def get_sign_conditions(tensor_list, cut_off):
     return sign_conditions
 
 
-def get_n_unique_signs(data_logger, cut_off, conservative_comparison = False, log_scale = False, dims = None):
+def get_n_unique_signs(data_logger, cut_off, conservative_comparison=False, log_scale=False, dims=None):
     n_unique_signs = []
-    for n in range(len(data_logger.network_data)):
-        data = convert_to_log(data_logger, n) if log_scale else data_logger.network_data[n]['dC_dl_list']
-        if dims is not None:
-            data = [data[i][dims[0], dims[1]] for i in range(len(data))]
+    
+    # Pre-allocate data processing
+    if log_scale:
+        data_list = [convert_to_log(data_logger, n) for n in range(len(data_logger.network_data))]
+    else:
+        data_list = [data_logger.network_data[n]['dC_dl_list'] for n in range(len(data_logger.network_data))]
+    
+    # Apply dimension filtering once if needed
+    if dims is not None:
+        rows, cols = dims
+        data_list = [[data[i][np.ix_(rows, cols)] for i in range(len(data))] for data in data_list]
+    
+    # Process all data in parallel if possible
+    for data in data_list:
         signs_conditions = get_sign_conditions(data, cut_off)
         n_unique, tensor_ids = count_unique_tensors_with_ids(signs_conditions, conservative_comparison)
         n_unique_signs.append(n_unique)
-    return n_unique_signs, tensor_ids
+    
+    return n_unique_signs
+
+def get_n_unique_signs_index(index, data_logger, cut_off, conservative_comparison = False, log_scale = False, dims = None):
+    data = convert_to_log(data_logger, index) if log_scale else data_logger.network_data[index]['dC_dl_list']
+    if dims is not None:
+        rows, cols = dims
+        data = [data[i][np.ix_(rows, cols)] for i in range(len(data))]
+    signs_conditions = get_sign_conditions(data, cut_off)
+    n_unique, tensor_ids = count_unique_tensors_with_ids(signs_conditions, conservative_comparison)
+    return n_unique, tensor_ids
 
 # Timeout handler function
 def timeout_handler(signum, frame):
@@ -553,7 +573,8 @@ class AdaptiveSampler:
                  l0_range: tuple = (0.0001, 1000.0),
                  profiler: TimeProfiler = None,
                  round_decimals: int = 3,
-                 use_signal_alarms: bool = True):
+                 use_signal_alarms: bool = True,
+                 steady_state_method: str = 'integration'):
         """
         Initialize the adaptive sampler.
         
@@ -570,6 +591,7 @@ class AdaptiveSampler:
             profiler: Optional TimeProfiler instance for timing
             round_decimals: Number of decimal places for rounding
             use_signal_alarms: Whether to use signal alarms for timeout handling
+            steady_state_method: Method for finding steady state ('integration' or 'root_finding')
         """
         self.min_samples = min_samples
         self.max_samples = max_samples
@@ -591,6 +613,7 @@ class AdaptiveSampler:
         self.new_sign_count = 0
         self.convergence_history = []
         self.l0_list = []
+        self.steady_state_method = steady_state_method
     def _check_convergence(self) -> bool:
         """
         Check if sampling has converged based on recent discovery rate.
@@ -663,15 +686,18 @@ class AdaptiveSampler:
                 flexible_reduced_ode_rhs = sim.make_reduced_rhs_with_conservation_flexible()
                 
                 # Integrate ODE
-                sol_reduced, C_reduced_final = sim.integrate(
-                    lambda C: flexible_reduced_ode_rhs(C, l0), 
-                    C_reduced_init, 
-                    t_span=t_span,
-                    num_points=num_points, 
-                    method=int_method, 
-                    rtol=r_tol, 
-                    atol=a_tol
-                )
+                if self.steady_state_method == 'root_finding':
+                    _, C_reduced_final = sim.minimize_to_steady_state(flexible_reduced_ode_rhs, C_reduced_init, l0)
+                else:
+                    sol_reduced, C_reduced_final = sim.integrate(
+                        lambda C: flexible_reduced_ode_rhs(C, l0), 
+                        C_reduced_init, 
+                        t_span=t_span,
+                        num_points=num_points, 
+                        method=int_method, 
+                        rtol=r_tol, 
+                        atol=a_tol
+                    )
                 
                 if self.use_signal_alarms:
                     signal.alarm(0)  # Cancel timeout
@@ -820,7 +846,8 @@ class GridSampler:
                  timeout_seconds: int = 30,
                  profiler: TimeProfiler = None,
                  round_decimals: int = 3,
-                 use_signal_alarms: bool = True):
+                 use_signal_alarms: bool = True,
+                 steady_state_method: str = 'integration'):
         """
         Initialize the grid sampler.
         
@@ -855,6 +882,7 @@ class GridSampler:
         self.new_sign_count = 0
         self.convergence_history = []
         self.l0_list = []
+        self.steady_state_method = steady_state_method
     
     def _get_sign_sample(self, l0, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
         """
@@ -902,15 +930,18 @@ class GridSampler:
                 flexible_reduced_ode_rhs = sim.make_reduced_rhs_with_conservation_flexible()
                 
                 # Integrate ODE
-                sol_reduced, C_reduced_final = sim.integrate(
-                    lambda C: flexible_reduced_ode_rhs(C, l0), 
-                    C_reduced_init, 
-                    t_span=t_span,
-                    num_points=num_points, 
-                    method=int_method, 
-                    rtol=r_tol, 
-                    atol=a_tol
-                )
+                if self.steady_state_method == 'root_finding':
+                    _, C_reduced_final = sim.minimize_to_steady_state(flexible_reduced_ode_rhs, C_reduced_init, l0)
+                else:
+                    sol_reduced, C_reduced_final = sim.integrate(
+                        lambda C: flexible_reduced_ode_rhs(C, l0), 
+                        C_reduced_init, 
+                        t_span=t_span,
+                        num_points=num_points, 
+                        method=int_method, 
+                        rtol=r_tol, 
+                        atol=a_tol
+                    )
                 
                 if self.use_signal_alarms:
                     signal.alarm(0)  # Cancel timeout

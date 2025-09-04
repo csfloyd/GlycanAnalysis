@@ -70,6 +70,52 @@ class ReactionNetworkSimulator:
         sol = solve_ivp(lambda t, C: ode_rhs(C), t_span, initial_conditions, t_eval=t_eval, **kwargs)
         return sol, sol.y[:,-1]
     
+    def minimize_to_steady_state(
+        self,
+        ode_rhs,
+        initial_conditions: np.ndarray,
+        l0: np.ndarray,
+        **kwargs
+        ) -> Tuple[object, np.ndarray]:
+        """
+        Find the steady state of an ODE system using root finding.
+
+        Args:
+            ode_rhs: Callable (y, l0) -> dy/dt (the ODE right-hand side)
+            initial_conditions: Initial concentrations (array)
+            l0: Conservation law constants (array)
+            kwargs: Additional arguments to pass to root finding
+
+        Returns:
+            result: The solution object from root finding
+            steady_state_concentrations: Concentrations at steady state
+        """
+        # def objective_function_transformed(x):
+        #     """Objective function with log transformation to ensure positive concentrations"""
+        #     C_reduced = np.exp(x)  # This ensures C > 0
+        #     return ode_rhs(C_reduced, l0)
+
+        # Transform initial guess to log space
+        # x_init = np.log(initial_conditions)
+        
+        def objective_function_transformed(x):
+            C_reduced = x**2  # Softplus: log(1 + exp(x))
+            return ode_rhs(C_reduced, l0)
+
+        x_init = np.sqrt(initial_conditions)
+
+        # Default options for root finding
+        # default_options = {'xtol': 1e-12, 'ftol': 1e-12, 'maxiter': 10000}
+        default_options = {'xtol': 1e-12}#, 'ftol': 1e-12}
+        options = {**default_options, **kwargs}
+        
+        result = root(objective_function_transformed, x_init, method='lm', options=default_options)
+
+        # Convert back from log space
+        steady_state_concentrations = result.x**2
+        
+        return result, steady_state_concentrations
+    
     def solve_conservation_laws(self):
         """
         Symbolically solves the conservation laws for the eliminated variables.

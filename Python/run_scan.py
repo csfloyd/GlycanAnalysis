@@ -11,7 +11,7 @@ import pickle
 parser = argparse.ArgumentParser(description="SLURM job script with arguments.")
 
 # Define command-line arguments
-parser.add_argument("--param1", type=int, required=True, help="An integer parameter")
+parser.add_argument("--param1", type=float, required=True, help="An integer parameter")
 parser.add_argument("--param2", type=int, required=False, help="An integer parameter")
 parser.add_argument("--output", type=str, required=True, help="A string parameter")
 
@@ -51,23 +51,26 @@ force_reverse = True
 L = np.array([[2, 1, 1, 0, 0, 0, 0, 0, 0, 0],
               [0, 0, 0, 2, 1, 1, 0, 0, 0, 0],
               [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]])
+
+
+
 n_cons = len(L)
 n_lcs = n_complexes - n_species + n_cons
 subset_group_ind = None
+seed = None
 
-
-E_range = 5
-B_range = 5
+E_range = 1
+B_range = 1
 F_range = args.param1
 C0 = 1
 beta = 1
 
-n_graph_samples = 2000
+n_graph_samples = 2500
 input_dim = 2
 default_l0 = np.array([1.0, 1.0, 1.0])
 sc_grad_dims = [[6,7,8,9],[0,1]]
 
-t_span = (0, 100000)
+t_span = (0, 10000)
 num_points = 10000
 int_method = 'LSODA'
 r_tol = 1e-10   
@@ -82,33 +85,37 @@ data_logger = NetworkDataLogger()
 profiler = TimeProfiler()
 profiler.start_total_timer()
 
-# ad_len = 50
-# sampler = AdaptiveSampler(
-#     input_dims=[0, 1],
-#     sc_grad_dims=sc_grad_dims,
-#     default_l0=default_l0,
-#     min_samples=ad_len,           # Minimum samples before checking convergence
-#     max_samples=1000,          # Maximum samples to prevent infinite loops
-#     convergence_window=ad_len,    # Window size for convergence check
-#     convergence_threshold=2/ad_len, # Stop when <% of recent samples are new
-#     timeout_seconds=5,       # Timeout for individual integrations
-#     l0_range=(1e-3, 1e3),
-#     profiler=profiler,         # Use existing profiler for timing
-#     round_decimals=6,
-# )
+sampler = "grid"
 
-sampler = GridSampler(
-    input_dims=[0, 1],
-    default_l0=default_l0,
-    sc_grad_dims=sc_grad_dims,
-    l0_range=(1e-3, 1e3),
-    l0_grid_size=10,
-    grid_dim=2,
-    timeout_seconds=5,
-    profiler=profiler,
-    round_decimals=6,
-    use_signal_alarms=False
-)
+if sampler == "adaptive":
+    ad_len = 50
+    sampler = AdaptiveSampler(
+        input_dims=[0, 1],
+        sc_grad_dims=sc_grad_dims,
+        default_l0=default_l0,
+        min_samples=ad_len,           # Minimum samples before checking convergence
+        max_samples=1000,          # Maximum samples to prevent infinite loops
+        convergence_window=ad_len,    # Window size for convergence check
+        convergence_threshold=2/ad_len, # Stop when <% of recent samples are new
+        timeout_seconds=5,       # Timeout for individual integrations
+        l0_range=(1e-4, 1e1),
+        profiler=profiler,         # Use existing profiler for timing
+        round_decimals=6,
+        use_signal_alarms=True
+    )
+else:
+    sampler = GridSampler(
+        input_dims=[0, 1],
+        default_l0=default_l0,
+        sc_grad_dims=sc_grad_dims,
+        l0_range=(1e0, 1e3),
+        l0_grid_size=20,
+        grid_dim=2,
+        timeout_seconds=5,
+        profiler=profiler,
+        round_decimals=6,
+        use_signal_alarms=True
+    )
 
 for iter in range(n_graph_samples):
     seed = np.random.randint(1000000)

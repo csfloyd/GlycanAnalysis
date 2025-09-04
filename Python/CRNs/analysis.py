@@ -68,8 +68,8 @@ def get_interaction_matrix(r_n):
         cr = r_n.all_complexes[cr_idx]
         cp = r_n.all_complexes[cp_idx]
 
-        cr_species = cr.split('+') if len(cr)==3 else [cr]
-        cp_species = cp.split('+') if len(cp)==3 else [cp]
+        cr_species = cr.split('+') if '+' in cr else [cr]
+        cp_species = cp.split('+') if '+' in cp else [cp]
         #print(cr_species, cp_species)
 
         # Get species involved (non-zero elements)
