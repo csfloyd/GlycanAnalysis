@@ -847,7 +847,8 @@ class GridSampler:
                  profiler: TimeProfiler = None,
                  round_decimals: int = 3,
                  use_signal_alarms: bool = True,
-                 steady_state_method: str = 'integration'):
+                 steady_state_method: str = 'integration',
+                 use_contour_integration: bool = False):
         """
         Initialize the grid sampler.
         
@@ -862,6 +863,8 @@ class GridSampler:
             profiler: Optional TimeProfiler instance for timing
             round_decimals: Number of decimal places for rounding
             use_signal_alarms: Whether to use signal alarms for timeout handling
+            steady_state_method: Method for finding steady state ('integration' or 'root_finding')
+            use_contour_integration: Whether to use contour integration for 1D cases
         """
         self.l0_range = l0_range
         self.l0_grid_size = l0_grid_size
@@ -883,6 +886,7 @@ class GridSampler:
         self.convergence_history = []
         self.l0_list = []
         self.steady_state_method = steady_state_method
+        self.use_contour_integration = use_contour_integration
     
     def _get_sign_sample(self, l0, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
         """
@@ -999,6 +1003,200 @@ class GridSampler:
                     if timer_name in self.profiler.timers and self.profiler.timers[timer_name]['start_time'] is not None:
                         self.profiler.end_timer(timer_name)
             return None, None, None, None, False
+    
+    def _sample_sign_conditions_contour_1d(self, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
+        """
+        Sample sign conditions using contour integration for 1D parameter space.
+        This method performs a single contour integration along the 1D parameter space
+        and extracts results at each grid point.
+        
+        Args:
+            sim: ReactionNetworkSimulator instance
+            L: Conservation law matrix
+            t_span: Integration time span
+            num_points: Number of integration points
+            int_method: Integration method
+            r_tol: Relative tolerance
+            a_tol: Absolute tolerance
+            precomputed_derivatives: Precomputed derivative functions (dR_dC_func, dR_dl_func, etc.)
+            
+        Returns:
+            tuple: (sign_conditions, C_full_list, dC_dl_list, l0_list, sample_count, convergence_reached)
+        """
+        if len(self.input_dims) != 1:
+            raise ValueError("Contour integration is only supported for 1D parameter spaces")
+        
+        try:
+            # Get grid bounds (use actual grid points, not theoretical bounds)
+            l0_min = self.l0_grid[0]
+            l0_max = self.l0_grid[-1]
+            dim = self.input_dims[0]
+            
+            # Set up initial conditions at leftmost point
+            l0_init = self.default_l0.copy()
+            l0_init[dim] = l0_min
+            
+            if self.profiler:
+                self.profiler.start_timer("contour_nnls")
+            
+            # Generate initial concentrations at leftmost point
+            C_full_init = generate_positive_initial_concentrations_nnls(L, l0_init)
+            
+            if self.profiler:
+                self.profiler.end_timer("contour_nnls")
+                self.profiler.start_timer("contour_initial_conditions")
+            
+            # Get reduced initial conditions
+            _, C_reduced_init = sim.get_const_and_reduced_init(C_full_init)
+            
+            if self.profiler:
+                self.profiler.end_timer("contour_initial_conditions")
+                self.profiler.start_timer("contour_steady_state")
+            
+            # Integrate to steady state at the leftmost point
+            try:
+                # Create flexible RHS function
+                flexible_reduced_ode_rhs = sim.make_reduced_rhs_with_conservation_flexible()
+                
+                # Integrate to steady state
+                if self.steady_state_method == 'root_finding':
+                    _, C_reduced_steady = sim.minimize_to_steady_state(flexible_reduced_ode_rhs, C_reduced_init, l0_init)
+                else:
+                    sol_reduced, C_reduced_steady = sim.integrate(
+                        lambda C: flexible_reduced_ode_rhs(C, l0_init), 
+                        C_reduced_init, 
+                        t_span=t_span,
+                        num_points=num_points, 
+                        method=int_method, 
+                        rtol=r_tol, 
+                        atol=a_tol
+                    )
+                
+                if self.profiler:
+                    self.profiler.end_timer("contour_steady_state")
+                    self.profiler.start_timer("contour_integration")
+                
+            except Exception as e:
+                print(f"Error in steady state integration: {e}")
+                if self.profiler:
+                    self.profiler.end_timer("contour_steady_state")
+                return [], [], [], [], 0, False
+            
+            # Set up timeout for integration
+            if self.use_signal_alarms:
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(self.timeout_seconds)
+            
+            try:
+                # Get precomputed derivatives
+                dR_dC_func, dR_dl_func = precomputed_derivatives
+                rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
+                
+                # Interpolate l0 at current t (t goes from 0 to 1) using log spacing
+                l0_current = self.default_l0.copy()
+
+
+                l0_vec = np.zeros_like(self.default_l0)
+                l0_vec[dim] = l0_max - l0_min
+                l0_norm = np.linalg.norm(l0_vec)
+                l0_unit_vec = l0_vec / l0_norm
+
+
+                def contour_ode_func(t, C_reduced):
+                    return sim.dC_func(
+                        t, C_reduced,
+                        rates,
+                        l0_unit_vec,
+                        l0_current,
+                        dR_dC_func,
+                        dR_dl_func
+                    )
+                
+  
+                t_eval = self.l0_grid - l0_min    
+                            
+                # Perform contour integration
+                sol = solve_ivp(
+                    contour_ode_func,
+                    t_span=(0, l0_norm),
+                    y0=C_reduced_steady,
+                    t_eval=t_eval,
+                    method=int_method, 
+                    rtol=r_tol,
+                    atol=a_tol
+                )
+                
+                if self.use_signal_alarms:
+                    signal.alarm(0)  # Cancel timeout
+                
+                if self.profiler:
+                    self.profiler.end_timer("contour_integration")
+                    self.profiler.start_timer("contour_processing")
+                
+                # Process results at each grid point
+                sign_conditions = []
+                C_full_list = []
+                dC_dl_list = []
+                l0_list = []
+                
+                for i, t_val in enumerate(t_eval):
+                    # Get l0 value at this grid point
+                    l0_current = self.default_l0.copy()
+                    l0_current[dim] = self.l0_grid[i]
+                    
+                    # Get reduced concentrations at this point
+                    C_reduced_current = sol.y[:, i]
+                    
+                    # Recover full species concentrations
+                    C_full_current = sim.recover_eliminated_species(l0_current, C_reduced_current)
+                    
+                    # Compute sensitivity derivatives
+                    dC_dl = sim.dC_dl_func(C_reduced_current, l0_current, rates, dR_dC_func, dR_dl_func)
+                    dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool=True)
+                    
+                    # Extract sign conditions
+                    if self.sc_grad_dims is not None:
+                        # Use only specified dimensions of dC_dl_full
+                        rows, cols = self.sc_grad_dims
+                        dC_dl_subset = dC_dl_full[np.ix_(rows, cols)]
+                        signs = np.sign(np.round(dC_dl_subset, decimals=self.round_decimals)).tolist()
+                    else:
+                        # Use all dimensions (original behavior)
+                        signs = np.sign(np.round(dC_dl_full, decimals=self.round_decimals)).tolist()
+                    
+                    # Store results
+                    sign_conditions.append(signs)
+                    C_full_list.append(C_full_current)
+                    dC_dl_list.append(dC_dl_full)
+                    l0_list.append(l0_current)
+                    self.sample_count += 1
+                
+                if self.profiler:
+                    self.profiler.end_timer("contour_processing")
+                
+                # Store results in class attributes
+                self.sign_conditions = sign_conditions
+                self.C_full_list = C_full_list
+                self.dC_dl_list = dC_dl_list
+                self.l0_list = l0_list
+                
+                return sign_conditions, C_full_list, dC_dl_list, l0_list, self.sample_count, True
+                
+            except TimeoutError:
+                if self.use_signal_alarms:
+                    signal.alarm(0)  # Cancel timeout
+                if self.profiler:
+                    self.profiler.end_timer("contour_integration")
+                return [], [], [], [], 0, False
+                
+        except Exception as e:
+            print(f"Error in contour integration: {e}")
+            if self.profiler:
+                # End any active timers
+                for timer_name in ["contour_nnls", "contour_initial_conditions", "contour_steady_state", "contour_integration", "contour_processing"]:
+                    if timer_name in self.profiler.timers and self.profiler.timers[timer_name]['start_time'] is not None:
+                        self.profiler.end_timer(timer_name)
+            return [], [], [], [], 0, False
         
     # def _get_sign_sample_contour(self, l0_init, C_reduced_init, l0, sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives):
     #     """
@@ -1135,6 +1333,13 @@ class GridSampler:
         Returns:
             tuple: (sign_conditions, C_full_list, dC_dl_list, l0_list, sample_count, convergence_reached)
         """
+        
+        # Check if we should use contour integration for 1D case
+        if self.use_contour_integration:
+            if len(self.input_dims) == 1:
+                return self._sample_sign_conditions_contour_1d(sim, L, t_span, num_points, int_method, r_tol, a_tol, precomputed_derivatives)
+            else:
+                print("Warning: Contour integration is only supported for 1D parameter spaces. Falling back to grid sampling.")
         
         # Create grid over the specified input dimensions
         l0_grid_iter = itertools.product(*[self.l0_grid] * len(self.input_dims))

@@ -86,7 +86,7 @@ def get_interaction_matrix(r_n):
                 if k != l:
                     interaction_matrix[k,l] += 1
 
-    return interaction_matrix
+    return interaction_matrix.T
 
 def compute_cycles(r_n):
         """

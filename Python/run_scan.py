@@ -44,13 +44,20 @@ output_dir = args.output
 # seed = None
 # subset_group_ind = None
 
-n_species = 10
-n_complexes = 11
-n_reactions = 10
+# n_species = 10
+# n_complexes = 11
+# n_reactions = 10
+# force_reverse = True
+# L = np.array([[2, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+#               [0, 0, 0, 2, 1, 1, 0, 0, 0, 0],
+#               [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]])
+
+n_species = 8
+n_complexes = 9
+n_reactions = 9
 force_reverse = True
-L = np.array([[2, 1, 1, 0, 0, 0, 0, 0, 0, 0],
-              [0, 0, 0, 2, 1, 1, 0, 0, 0, 0],
-              [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]])
+L = np.array([[2, 1, 1, 1, 0, 0, 0, 0],
+              [0, 0, 0, 0, 2, 1, 1, 1]])
 
 
 
@@ -66,15 +73,19 @@ C0 = 1
 beta = 1
 
 n_graph_samples = 2500
-input_dim = 2
-default_l0 = np.array([1.0, 1.0, 1.0])
-sc_grad_dims = [[6,7,8,9],[0,1]]
+# input_dim = 2
+# default_l0 = np.array([1.0, 1.0, 1.0])
+# sc_grad_dims = [[6,7,8,9],[0,1]]
+
+input_dim = 1
+default_l0 = np.array([1.0, 1.0])
+sc_grad_dims = [[4,5,6,7],[0]]
 
 t_span = (0, 10000)
 num_points = 10000
 int_method = 'LSODA'
-r_tol = 1e-10   
-a_tol = 1e-10
+r_tol = 1e-12   
+a_tol = 1e-12
 
 if seed is not None:
     np.random.seed(seed)
@@ -90,7 +101,7 @@ sampler = "grid"
 if sampler == "adaptive":
     ad_len = 50
     sampler = AdaptiveSampler(
-        input_dims=[0, 1],
+        input_dims=[0],
         sc_grad_dims=sc_grad_dims,
         default_l0=default_l0,
         min_samples=ad_len,           # Minimum samples before checking convergence
@@ -105,12 +116,12 @@ if sampler == "adaptive":
     )
 else:
     sampler = GridSampler(
-        input_dims=[0, 1],
+        input_dims=[0],
         default_l0=default_l0,
         sc_grad_dims=sc_grad_dims,
-        l0_range=(1e0, 1e3),
+        l0_range=(1e-3, 1e1),
         l0_grid_size=20,
-        grid_dim=2,
+        grid_dim=1,
         timeout_seconds=5,
         profiler=profiler,
         round_decimals=6,
