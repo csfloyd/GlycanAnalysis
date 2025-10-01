@@ -132,3 +132,52 @@ def compute_cycles(r_n):
             cycles.append(cycle_reactions)
             
         return Z, cycles
+
+def calculate_finite_differences(y, x, log_y=False, log_x=False):
+    """
+    Calculate finite difference approximation of dy/dx using central difference.
+    Optional log transformation of x and/or y before calculating differences.
+    
+    Args:
+        y: List of y values
+        x: List of x values
+        log_y: Boolean indicating whether to take log10 of y values
+        log_x: Boolean indicating whether to take log10 of x values
+        
+    Returns:
+        List of finite difference approximations
+    """
+    d_vals_fd = []
+    
+    # Transform values if needed
+    x_vals = np.log10(x) if log_x else x
+    y_vals = np.log10(y) if log_y else y
+    
+    # First point uses forward difference
+    dy = y_vals[1] - y_vals[0]
+    dx = x_vals[1] - x_vals[0]
+    d_vals_fd.append(dy/dx)
+    
+    # Central difference for middle points
+    for i in range(1, len(x)-1):
+        dy = y_vals[i+1] - y_vals[i-1]
+        dx = x_vals[i+1] - x_vals[i-1]
+        d_vals_fd.append(dy/dx)
+        
+    # Last point uses backward difference
+    dy = y_vals[-1] - y_vals[-2]
+    dx = x_vals[-1] - x_vals[-2]
+    d_vals_fd.append(dy/dx)
+    
+    return d_vals_fd
+
+def check_list_consistency(base_list, comparison_list, threshold=0.1, epsilon=0, pad = 0):
+    # Convert lists to numpy arrays for vectorized operations
+    base_arr = np.array(base_list)
+    comp_arr = np.array(comparison_list)
+    
+    # Calculate differences ratio array
+    diff_ratios = np.abs(comp_arr[pad:-pad] - base_arr[pad:-pad])/(np.max(np.abs(base_arr[pad:-pad]) + epsilon))
+    
+    # Check if any ratio exceeds threshold
+    return not (diff_ratios > threshold).any()

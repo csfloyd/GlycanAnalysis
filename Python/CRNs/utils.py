@@ -414,48 +414,47 @@ class NetworkDataLogger:
         if filepath is not None:
             self.load_data(filepath)
         
-    def log_network(self, 
-                   r_n, 
-                   interaction_matrix, 
-                   cycles, 
-                   sign_conditions,
-                   C_full_list,
-                   l0_list,
-                   iteration: int = None,
-                   seed: int = None,
-                   **kwargs):
-        # Extract essential network parameters for reconstruction
-        network_params = {
-            'all_complexes': r_n.all_complexes,
-            'reactions': r_n.reactions,
-            'n_species': r_n.n_species,
-            'n_complexes': r_n.n_complexes,
-            'n_reactions': r_n.n_reactions,
-            'n_lcs': r_n.n_lcs,
-            'L': r_n.L,
-            'complexes_per_class': r_n.complexes_per_class,
-            'reactions_per_class': r_n.reactions_per_class,
-            'force_reverse': r_n.force_reverse,
-            'subset_group_ind': r_n.subset_group_ind,
-            'reaction_strings': r_n.get_reaction_strings_simple(include_reverse=False),
-            'species_names': r_n.species_names,
-            'seed': r_n.seed
-        }
+    def log_network(self, **kwargs):
+        """
+        Log network data with arbitrary parameters.
         
-        # Create data entry
-        data_entry = {
-            'network_params': network_params,
-            'interaction_matrix': interaction_matrix,
-            'cycles': cycles,
-            'n_cycles': len(cycles[1]),
-            'sign_conditions': sign_conditions,
-            'n_sign_conditions': len(set(str(s) for s in sign_conditions)),
-            'C_full_list': C_full_list,
-            'l0_list': l0_list,
-            'iteration': iteration,
-            'seed': seed,
-            **kwargs
-        }
+        All provided keyword arguments will be stored in the data entry.
+        No parameters are required - you can store any data you want.
+        
+        Common parameters you might want to include:
+        - r_n: ReactionNetwork instance (will extract network_params if provided)
+        - interaction_matrix: Interaction matrix data
+        - cycles: Cycle data
+        - sign_conditions: Sign condition data
+        - C_full_list: Concentration data
+        - l0_list: Conservation law data
+        - iteration: Iteration number
+        - seed: Random seed
+        - Any other custom data you want to store
+        """
+        # Create data entry with all provided kwargs except r_n
+        data_entry = {k: v for k, v in kwargs.items() if k != 'r_n'}
+        
+        # If r_n is provided, extract network parameters for reconstruction
+        if 'r_n' in kwargs:
+            r_n = kwargs['r_n']
+            network_params = {
+                'all_complexes': r_n.all_complexes,
+                'reactions': r_n.reactions,
+                'n_species': r_n.n_species,
+                'n_complexes': r_n.n_complexes,
+                'n_reactions': r_n.n_reactions,
+                'n_lcs': r_n.n_lcs,
+                'L': r_n.L,
+                'complexes_per_class': r_n.complexes_per_class,
+                'reactions_per_class': r_n.reactions_per_class,
+                'force_reverse': r_n.force_reverse,
+                'subset_group_ind': r_n.subset_group_ind,
+                'reaction_strings': r_n.get_reaction_strings_simple(include_reverse=False),
+                'species_names': r_n.species_names,
+                'seed': r_n.seed
+            }
+            data_entry['network_params'] = network_params
         
         self.network_data.append(data_entry)
         
@@ -1094,6 +1093,7 @@ class GridSampler:
                 
                 # Interpolate l0 at current t (t goes from 0 to 1) using log spacing
                 l0_current = self.default_l0.copy()
+                l0_current[dim] = l0_min
 
 
                 l0_vec = np.zeros_like(self.default_l0)
@@ -1113,8 +1113,7 @@ class GridSampler:
                     )
                 
   
-                t_eval = self.l0_grid - l0_min    
-                            
+                t_eval = self.l0_grid - l0_min                              
                 # Perform contour integration
                 sol = solve_ivp(
                     contour_ode_func,
