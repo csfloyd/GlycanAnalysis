@@ -319,12 +319,144 @@ def generate_feedforward_signaling_network(NR, NS_vec, include_reverse=False, in
     L = np.zeros((NR + np.sum(NS_vec), len(species_names)))
     for i in range(NR):
         L[i, i] = 1
+    flat_idx = 0
     for l in range(len(NS_vec)):
         for j in range(NS_vec[l]):
-            L[NR + l*NS + j, species_names.index(f'S{l}{j}s')] = 1
-            L[NR + l*NS + j, species_names.index(f'S{l}{j}')] = 1
+            L[NR + flat_idx, species_names.index(f'S{l}{j}s')] = 1
+            L[NR + flat_idx, species_names.index(f'S{l}{j}')] = 1
+            flat_idx += 1
 
     return species_names, reaction_strings, L
+
+
+def generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, p_f = 1, include_reverse=False, include_uncatalyzed=True, seed=None):
+    """
+    Generate a layered feedforward signaling network with NR receptors and layers of ligands specified by NS_vec.
+    Similar interface to generate_dag_signaling_network but maintains layered structure.
+    
+    Args:
+        NR: Number of receptors (upstream nodes)
+        NS_vec: List specifying number of ligands in each layer
+        p_f: Probability for forward connections between layers
+        p_r: Probability for recurrent connections (backward connections within/across layers)
+        include_reverse: Whether to include reverse reactions
+        include_uncatalyzed: Whether to include uncatalyzed activation/deactivation
+        seed: Random seed for reproducibility
+        
+    Returns:
+        species_names: List of species names
+        reaction_strings: List of reaction strings
+        L: Conservation law matrix
+        adjacency_matrix: The generated adjacency matrix (flattened to 2D for all substrates)
+        input_substrates_list: List of substrate indices that are input substrates for each receptor
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    reaction_strings = []
+    species_names = []
+    
+    # Calculate total number of substrates across all layers
+    total_NS = sum(NS_vec)
+    
+    # Generate species names (using flat indexing)
+    for i in range(NR):
+        species_names.append(f'R{i}')
+    flat_idx = 0
+    for l in range(len(NS_vec)):
+        for j in range(NS_vec[l]):
+            species_names.append(f'S{flat_idx}s')  # inactive form
+            species_names.append(f'S{flat_idx}')   # active form
+            flat_idx += 1
+    
+    # Create adjacency matrix for all substrates (flattened across layers)
+    # This will be a total_NS x total_NS matrix
+    adjacency_matrix = np.zeros((total_NS, total_NS))
+    
+    # Create mapping from (layer, index) to flattened index
+    layer_to_flat = {}
+    flat_idx = 0
+    for l in range(len(NS_vec)):
+        for j in range(NS_vec[l]):
+            layer_to_flat[(l, j)] = flat_idx
+            flat_idx += 1
+    
+    # Fill forward connections between layers with probability p_f
+    for l in range(len(NS_vec) - 1):  # For each layer except the last
+        for i in range(NS_vec[l]):    # For each substrate in current layer
+            for j in range(NS_vec[l + 1]):  # For each substrate in next layer
+                if np.random.rand() < p_f:
+                    flat_i = layer_to_flat[(l, i)]
+                    flat_j = layer_to_flat[(l + 1, j)]
+                    adjacency_matrix[flat_i, flat_j] = 1
+    
+    # Generate receptor-substrate reactions (receptors can activate randomly selected input substrates)
+    # Randomly select input substrates from first layer with probability p_f
+    input_substrates_list = []
+    for i in range(NR):
+        input_substrates = []
+        for j in range(NS_vec[0]):  # Only first layer can be input substrates
+            if np.random.rand() < p_f:
+                input_substrates.append(layer_to_flat[(0, j)])
+        if len(input_substrates) == 0:  # ensure that there is at least one input substrate
+            input_substrates = [0]
+        input_substrates_list.append(input_substrates)
+    
+    # Add recurrent connections with probability p_r
+    # These can be within layers or backward across layers
+    for i in range(total_NS):
+        for j in range(total_NS):
+            if i != j and adjacency_matrix[i, j] == 0:  # Don't overwrite existing forward connections
+                if np.random.rand() < p_r:
+                    adjacency_matrix[i, j] = 1
+    
+    # Generate receptor-substrate reactions
+    for i in range(NR):
+        for flat_j in input_substrates_list[i]:
+            reac = f'R{i}+S{flat_j}s -> R{i}+S{flat_j}'
+            reaction_strings.append(reac)
+            if include_reverse:
+                reac = f'R{i}+S{flat_j} -> R{i}+S{flat_j}s'
+                reaction_strings.append(reac)
+    
+    # Generate substrate-substrate reactions based on adjacency matrix
+    for i in range(total_NS):
+        for j in range(total_NS):
+            if adjacency_matrix[i, j] == 1:  # If there's a connection from S_i to S_j
+                reac = f'S{i}+S{j}s -> S{i}+S{j}'
+                reaction_strings.append(reac)
+                if include_reverse:
+                    reac = f'S{i}+S{j} -> S{i}+S{j}s'
+                    reaction_strings.append(reac)
+    
+    # Generate uncatalyzed activation/deactivation reactions
+    if include_uncatalyzed:
+        flat_idx = 0
+        for l in range(len(NS_vec)):
+            for j in range(NS_vec[l]):
+                reac = f'S{flat_idx}s -> S{flat_idx}'
+                reaction_strings.append(reac)
+                if include_reverse:
+                    reac = f'S{flat_idx} -> S{flat_idx}s'
+                    reaction_strings.append(reac)
+                flat_idx += 1
+    
+    # Generate conservation law matrix
+    L = np.zeros((NR + total_NS, len(species_names)))
+    
+    # Conservation laws for receptors (each receptor is conserved)
+    for i in range(NR):
+        L[i, i] = 1
+    
+    # Conservation laws for substrates (each substrate has conserved total: S{flat_idx}s + S{flat_idx})
+    flat_idx = 0
+    for l in range(len(NS_vec)):
+        for j in range(NS_vec[l]):
+            L[NR + flat_idx, species_names.index(f'S{flat_idx}s')] = 1
+            L[NR + flat_idx, species_names.index(f'S{flat_idx}')] = 1
+            flat_idx += 1
+    
+    return species_names, reaction_strings, L, adjacency_matrix, input_substrates_list
 
 def generate_random_signaling_network(NR, NS, NS_in, prob, include_reverse=False, include_uncatalyzed=True):
     """
@@ -395,6 +527,8 @@ def generate_random_signaling_network(NR, NS, NS_in, prob, include_reverse=False
 
     return species_names, reaction_strings, L, input_indices
 
+
+
 def generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=False, include_uncatalyzed=True, seed=None):
     """
     Generate a signaling network based on a directed acyclic graph (DAG) structure.
@@ -440,10 +574,15 @@ def generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=False, incl
 
     # Generate receptor-substrate reactions (receptors can activate randomly selected input substrates)
     # Randomly select input substrates with probability p_f
-    input_substrates = []
-    for j in range(NS):
-        if np.random.rand() < p_f:
-            input_substrates.append(j)
+    input_substrates_list = []
+    for i in range(NR):
+        input_substrates = []
+        for j in range(NS):
+            if np.random.rand() < p_f:
+                input_substrates.append(j)
+        if len(input_substrates) == 0: # ensure that there is at least one input substrate
+            input_substrates = [0]
+        input_substrates_list.append(input_substrates)
     
     # Add some backward connections in lower triangular part with probability p_r
     # for i in range(1, NS):
@@ -451,19 +590,19 @@ def generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=False, incl
     #         if np.random.rand() < p_r:
     #             adjacency_matrix[i, j] = 1
 
-    G_original = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates, NR, NS)
+    G_original = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
     adjacency_matrix_original = adjacency_matrix.copy()
     n_paths = count_simple_paths(G_original, f'R0', f'S{NS-1}')
     for i in range(1, NS):
         for j in range(i):
             if np.random.rand() < p_r:
                 adjacency_matrix[i, j] = 1
-                G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates, NR, NS)
+                G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
                 if count_simple_paths(G, f'R0', f'S{NS-1}') != n_paths:
                     adjacency_matrix[i, j] = 0
     
     for i in range(NR):
-        for j in input_substrates:
+        for j in input_substrates_list[i]:
             reac = f'R{i}+S{j}s -> R{i}+S{j}'
             reaction_strings.append(reac)
             if include_reverse:
@@ -502,9 +641,88 @@ def generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=False, incl
         L[NR + j, species_names.index(f'S{j}s')] = 1
         L[NR + j, species_names.index(f'S{j}')] = 1
     
-    return species_names, reaction_strings, L, adjacency_matrix, input_substrates
+    return species_names, reaction_strings, L, adjacency_matrix, input_substrates_list
 
-def get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates, NR, NS):
+def generate_specified_dag_signaling_network(adjacency_matrix, input_substrates_list, include_reverse=False, include_uncatalyzed=True, seed=None):
+    """
+    Generate a signaling network based on a directed acyclic graph (DAG) structure.
+    
+    Args:
+        NR: Number of receptors (upstream nodes)
+        NS: Number of substrates in the DAG
+        adjacency_matrix: The adjacency matrix for substrate-substrate connections
+        input_substrates_list: List of substrate indices that are input substrates
+        include_reverse: Whether to include reverse reactions
+        include_uncatalyzed: Whether to include uncatalyzed activation/deactivation
+        seed: Random seed for reproducibility
+        
+    Returns:
+        species_names: List of species names    
+        reaction_strings: List of reaction strings
+        L: Conservation law matrix
+        adjacency_matrix: The adjacency matrix for substrate-substrate connections
+        input_substrates_list: List of substrate indices that are input substrates
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    reaction_strings = []
+    species_names = []
+    
+    NS = adjacency_matrix.shape[0]
+    NR = len(input_substrates_list)
+    
+    # Generate species names
+    for i in range(NR):
+        species_names.append(f'R{i}')
+    for j in range(NS):
+        species_names.append(f'S{j}s')  # inactive form
+        species_names.append(f'S{j}')   # active form
+    
+    
+    for i in range(NR):
+        for j in input_substrates_list[i]:
+            reac = f'R{i}+S{j}s -> R{i}+S{j}'
+            reaction_strings.append(reac)
+            if include_reverse:
+                reac = f'R{i}+S{j} -> R{i}+S{j}s'
+                reaction_strings.append(reac)
+    
+    # Generate substrate-substrate reactions based on adjacency matrix
+    # Only include reactions for directed edges in the DAG (i -> j means active S_i can catalyze activation of S_j)
+    for i in range(NS):
+        for j in range(NS):
+            if adjacency_matrix[i, j] == 1:  # If there's a connection from S_i to S_j
+                reac = f'S{i}+S{j}s -> S{i}+S{j}'
+                reaction_strings.append(reac)
+                if include_reverse:
+                    reac = f'S{i}+S{j} -> S{i}+S{j}s'
+                    reaction_strings.append(reac)
+    
+    # Generate uncatalyzed activation/deactivation reactions
+    if include_uncatalyzed:
+        for j in range(NS):
+            reac = f'S{j}s -> S{j}'
+            reaction_strings.append(reac)
+            if include_reverse:
+                reac = f'S{j} -> S{j}s'
+                reaction_strings.append(reac)
+    
+    # Generate conservation law matrix
+    L = np.zeros((NR + NS, len(species_names)))
+    
+    # Conservation laws for receptors (each receptor is conserved)
+    for i in range(NR):
+        L[i, i] = 1
+    
+    # Conservation laws for substrates (each substrate has conserved total: S{j}s + S{j})
+    for j in range(NS):
+        L[NR + j, species_names.index(f'S{j}s')] = 1
+        L[NR + j, species_names.index(f'S{j}')] = 1
+    
+    return species_names, reaction_strings, L
+
+def get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS):
     # Create a directed graph
     G = nx.DiGraph()
     
@@ -518,7 +736,7 @@ def get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates, NR, NS
     
     # Add receptor-substrate edges (for input substrates)
     for i in range(NR):
-        for j in input_substrates:
+        for j in input_substrates_list[i]:
             G.add_edge(f'R{i}', f'S{j}', edge_type='receptor')
     
     # Add substrate-substrate edges based on adjacency matrix
@@ -535,13 +753,13 @@ def count_simple_paths(G, source, target):
     except nx.NetworkXNoPath:
         return 0
 
-def visualize_dag_signaling_network(adjacency_matrix, input_substrates, NR, NS):
+def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR, NS):
     """
     Visualize the DAG signaling network including receptor connections.
     
     Args:
         adjacency_matrix: The adjacency matrix for substrate-substrate connections
-        input_substrates: List of substrate indices that are input substrates
+        input_substrates_list: List of substrate indices that are input substrates
         NR: Number of receptors
         NS: Number of substrates
 
@@ -554,7 +772,7 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates, NR, NS):
     import networkx as nx
     
     # Create a directed graph
-    G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates, NR, NS)
+    G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
        
     # Create the plot
     fig, ax = plt.subplots(figsize=(6, 6))

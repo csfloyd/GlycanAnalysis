@@ -5,14 +5,15 @@ import argparse
 import time
 import copy
 import pickle
-
+import ast
 
 
 # Create argument parser
 parser = argparse.ArgumentParser(description="SLURM job script with arguments.")
 
+arg1_type = str
 # Define command-line arguments
-parser.add_argument("--param1", type=float, required=True, help="An integer parameter")
+parser.add_argument("--param1", type=arg1_type, required=True, help="An integer parameter")
 parser.add_argument("--param2", type=int, required=False, help="An integer parameter")
 parser.add_argument("--output", type=str, required=True, help="A string parameter")
 
@@ -21,14 +22,19 @@ args = parser.parse_args()
 
 output_dir = args.output
 
-seed = args.param2
+#seed = args.param2
+seed = 40
 
 ### Signaling network 
 NR = 1
-NS = 4
-target_node = 'S'+str(NR+NS-2)
-p_f = 0.75
-p_r = args.param1
+# NS = 3
+# p_f = 0.8
+p_r = 1
+# Convert string to list of integers
+NS_vec = [int(digit) for digit in args.param1]
+NS_vec.append(1)
+NS = sum(NS_vec)
+target_node = 'S'+str(NS-1)
 
 E_range = 5.0
 B_range = 5.0
@@ -38,7 +44,7 @@ beta = 1
 l0_range = (1e-3, 1e3)
 
 
-n_graph_samples = 25000
+n_graph_samples = 50000
 
 t_span = (0, 10000)
 num_points = 10000
@@ -51,10 +57,11 @@ if seed is not None:
     np.random.seed(seed)
     random.seed(seed)
 
+#species_names, reaction_strings, L, adjacency_matrix, input_substrates = generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=True, include_uncatalyzed=True)
+species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r)
 
-species_names, reaction_strings, L, adjacency_matrix, input_substrates = generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=False, include_uncatalyzed=True)
-G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates, NR, NS)
-target_node = 'S'+str(NR+NS-2)
+G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
+target_node = 'S'+str(NS-1)
 target_node_idx = species_names.index(target_node)
 
 print("Number of paths is", len(count_simple_paths(G, 'R0', target_node)))
@@ -222,7 +229,7 @@ for iter in range(n_graph_samples):
     data_logger.log_network(
         r_n=r_n,
         interaction_matrix=interaction_matrix,
-        input_substrates=input_substrates,
+        input_substrates_list=input_substrates_list,
         NR=NR,
         NS=NS,
         target_node=target_node,
