@@ -29,22 +29,22 @@ seed = 40
 NR = 1
 # NS = 3
 # p_f = 0.8
-p_r = 1
+p_r = 0
 # Convert string to list of integers
 NS_vec = [int(digit) for digit in args.param1]
 NS_vec.append(1)
 NS = sum(NS_vec)
 target_node = 'S'+str(NS-1)
 
-E_range = 5.0
-B_range = 5.0
-F_range = 5.0
+E_range = 8.0
+B_range = 8.0
+F_range = 8.0
 C0 = 1
 beta = 1
 l0_range = (1e-3, 1e3)
 
 
-n_graph_samples = 50000
+n_graph_samples = 10000
 
 t_span = (0, 10000)
 num_points = 10000
@@ -58,7 +58,7 @@ if seed is not None:
     random.seed(seed)
 
 #species_names, reaction_strings, L, adjacency_matrix, input_substrates = generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=True, include_uncatalyzed=True)
-species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r)
+species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, include_reverse=False, include_uncatalyzed=True)
 
 G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
 target_node = 'S'+str(NS-1)
@@ -101,8 +101,6 @@ data_logger = NetworkDataLogger()
 profiler = TimeProfiler()
 profiler.start_total_timer()
 
-sampler = "grid"
-
 sampler = GridSampler(
     input_dims=input_dims,
     default_l0=default_l0,
@@ -110,14 +108,17 @@ sampler = GridSampler(
     l0_range=l0_range,
     l0_grid_size=50,
     grid_dim=1,
-    timeout_seconds=1,
+    timeout_seconds=5,
     profiler=profiler,
     round_decimals=6,
-    use_signal_alarms=True,
+    use_signal_alarms=False,
     use_contour_integration=True
 )
 
 for iter in range(n_graph_samples):
+
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(5)
 
     # Time network generation
     profiler.start_timer("network_generation")
@@ -131,7 +132,7 @@ for iter in range(n_graph_samples):
             )
         else:
             r_n = r_n_base
-        if latin_hypercube_sampling:
+        if lhs_bool:
             sample = samples[iter]
             E_list = sample[:n_species]
             B_list = sample[n_species:n_species+n_reactions]
@@ -226,6 +227,11 @@ for iter in range(n_graph_samples):
     dC_dl_list_sub = [dC_dl[target_node_idx, input_dims[0]] for dC_dl in dC_dl_list]
     C_full_list_sub = [C_full[target_node_idx] for C_full in C_full_list]
 
+    if signal.alarm(0) == 0:
+        sig_bool = True
+    else:
+        sig_bool = False
+
     data_logger.log_network(
         r_n=r_n,
         interaction_matrix=interaction_matrix,
@@ -239,7 +245,8 @@ for iter in range(n_graph_samples):
         dC_dl_list=dC_dl_list_sub,
         l0_list=l0_list,
         iteration=iter,
-        seed=seed
+        seed=seed,
+        sig_bool=sig_bool
     )
     profiler.end_timer("data_logging")
 

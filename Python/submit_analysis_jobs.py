@@ -2,7 +2,7 @@ import os
 import shutil
 
 n_params = 1
-dir = "ff_scan_pr0"
+dir = "ff_scan_pr1"
 inputs_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/" + dir + "/"
 results_base = "/project/svaikunt/csfloyd/TrainingCRNs/AnalyzedData/" + dir + "/"
 

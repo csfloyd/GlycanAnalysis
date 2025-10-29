@@ -9,7 +9,9 @@ import numpy as np
 import sympy
 import itertools
 from typing import List, Dict, Tuple
-
+from scipy.interpolate import CubicSpline
+from sklearn.decomposition import PCA
+from .generation import *
 
 def count_conservation_group_changes(r_n):
     # Get conservation groups
@@ -453,6 +455,168 @@ def count_critical_points(network_data, target_node_idx=None, l0_list=None, fd_c
         print(f"Error in count_critical_points: {e}")
         return None, None
 
+def count_paths_to_target(data_logger, network_index, source_node='R0', target_node=None):
+    network_data = data_logger.get_network_by_index(network_index)
+    
+    adjacency_matrix = network_data['adjacency_matrix']
+    input_substrates_list = network_data['input_substrates_list']
+    NR = network_data['NR']
+    NS = network_data['NS']
+    network_params = network_data['network_params']
+    species_names = network_params['species_names']
+
+    # Default target is the last species
+    if target_node is None:
+        target_node = 'S' + str(NS - 1)
+    target_node_idx = species_names.index(target_node)
+
+    # Create directed graph from adjacency matrix
+    G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
+    
+    # Count simple paths
+    n_paths = len(count_simple_paths(G, source_node, target_node))
+    
+    return (target_node, target_node_idx, n_paths)
+
+
+def fit_pca_on_networks(data_logger, n_points=200, target_species_idx=None, n_samples=None, network_indices=None):
+    """
+    Fit PCA on interpolated concentration curves from multiple networks.
+    
+    Parameters:
+    -----------
+    data_logger : NetworkDataLogger object or list of network_data dicts
+        Data source containing network information
+    n_points : int, default=200
+        Number of interpolation points for each curve
+    target_species_idx : int, optional
+        Index of target species to analyze. If None, uses the last species (NS-1)
+    n_samples : int, optional
+        Number of networks to process. If None, processes all networks
+    network_indices : list, optional
+        Specific network indices to process. Overrides n_samples if provided
+        
+    Returns:
+    --------
+    dict containing:
+        'pca': Fitted PCA object (can be pickled)
+        'pca_result': Transformed data (principal components)
+        'data_matrix': Original interpolated data matrix (n_samples x n_points)
+        'explained_variance_ratio': Explained variance ratio for each component
+        'x_interp': Interpolation x-coordinates (log10 scale)
+        'n_components': Number of components
+        'target_species_idx': Index of species that was analyzed
+    """
+    
+    # Handle data_logger input
+    if hasattr(data_logger, 'network_data'):
+        # It's a NetworkDataLogger object
+        total_networks = len(data_logger.network_data)
+        get_network = lambda idx: data_logger.get_network_by_index(idx)
+    elif isinstance(data_logger, list):
+        # It's a list of network_data dicts
+        total_networks = len(data_logger)
+        get_network = lambda idx: data_logger[idx]
+    else:
+        raise ValueError("data_logger must be a NetworkDataLogger object or list of network_data dicts")
+    
+    # Determine which networks to process
+    if network_indices is not None:
+        indices_to_process = network_indices
+        actual_n_samples = len(network_indices)
+    elif n_samples is not None:
+        actual_n_samples = min(n_samples, total_networks)
+        indices_to_process = range(actual_n_samples)
+    else:
+        actual_n_samples = total_networks
+        indices_to_process = range(actual_n_samples)
+    
+    # Determine target species
+    if target_species_idx is None:
+        # Get from first network
+        first_network = get_network(indices_to_process[0])
+        if 'network_params' in first_network and 'NS' in first_network['network_params']:
+            target_species_idx = first_network['network_params']['NS'] - 1
+        else:
+            # Try to infer from C_full_list structure
+            C_sample = first_network['C_full_list'][0]
+            if isinstance(C_sample, (list, np.ndarray)) and len(np.shape(C_sample)) > 0:
+                target_species_idx = len(C_sample) - 1
+            else:
+                # C_full_list appears to be for a single species already
+                target_species_idx = 0
+    
+    # Initialize data matrix
+    data_matrix = np.zeros((actual_n_samples, n_points))
+    x_interp_global = None
+    
+    # Process each network
+    for i, network_idx in enumerate(indices_to_process):
+        try:
+            network_data = get_network(network_idx)
+            
+            # Extract l0 list and create log scale
+            l0_list = network_data['l0_list']
+            log_l0_x = [np.log10(l0[0]) if isinstance(l0, (list, np.ndarray)) else np.log10(l0) 
+                       for l0 in l0_list]
+            
+            # Extract concentration data for target species
+            C_full_list = network_data['C_full_list']
+            if isinstance(C_full_list[0], (list, np.ndarray)) and len(np.shape(C_full_list[0])) > 0:
+                C_data = [C_full_list[j][target_species_idx] for j in range(len(C_full_list))]
+            else:
+                C_data = C_full_list
+            
+            # Create cubic spline interpolator
+            cs = CubicSpline(log_l0_x, C_data)
+            
+            # Generate interpolated points
+            x_interp = np.linspace(min(log_l0_x), max(log_l0_x), n_points)
+            sampled_points = cs(x_interp)
+            
+            # Store in data matrix
+            data_matrix[i, :] = sampled_points
+            
+            # Save x_interp from first network for reference
+            if x_interp_global is None:
+                x_interp_global = x_interp
+                
+        except Exception as e:
+            print(f"Warning: Failed to process network {network_idx}: {e}")
+            # Fill with NaN or zeros
+            data_matrix[i, :] = np.nan
+    
+    # Check for any failed networks
+    valid_rows = ~np.isnan(data_matrix).any(axis=1)
+    if not valid_rows.all():
+        print(f"Warning: {(~valid_rows).sum()} networks failed. Removing from analysis.")
+        data_matrix = data_matrix[valid_rows]
+    
+    if data_matrix.shape[0] == 0:
+        raise ValueError("No valid networks to process")
+    
+    # Perform PCA
+    pca = PCA()
+    pca_result = pca.fit_transform(data_matrix)
+    
+    # Get explained variance ratio
+    explained_variance_ratio = pca.explained_variance_ratio_
+    
+    return {
+        'explained_variance': pca.explained_variance_,
+        'data_matrix': data_matrix
+
+        # 'pca': pca,
+        # 'pca_result': pca_result,
+        # 'explained_variance_ratio': explained_variance_ratio,
+        # 'cumulative_variance': np.cumsum(explained_variance_ratio),
+        # 'x_interp': x_interp_global,
+        # 'n_components': pca.n_components_,
+        # 'target_species_idx': target_species_idx,
+        # 'n_points': n_points,
+        # 'n_samples': data_matrix.shape[0]
+    }
+
 
 def select_best_mlp_width(x_vals, y_vals, width_range=(2, 20), normalize_x=True, random_state=42, r2_threshold = 0.99, quiet = True):
     """
@@ -565,7 +729,13 @@ def select_best_mlp_width(x_vals, y_vals, width_range=(2, 20), normalize_x=True,
     valid_metrics = [m for m in metrics if m['mse'] != np.inf]
     
     if not valid_metrics:
-        raise ValueError("No valid fits found!")
+        return {
+        'best_width': None,
+        'summary':  None,
+        'all_metrics': None,
+        'all_results': None,
+        'recommended_result': None
+        }
     
     # Find smallest width meeting R² threshold
     candidates = [m for m in valid_metrics if m['r_squared'] >= r2_threshold]

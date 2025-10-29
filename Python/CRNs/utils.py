@@ -107,7 +107,7 @@ def clamp_sign(sign_array, off):
     result[sign_array < -off] = -1
     return result
 
-def convert_to_log(data_logger, network_index):
+def convert_to_log(data_logger, network_index, log_y=False, log_x=False):
     dC_dl_list = data_logger.network_data[network_index]['dC_dl_list']
     C_full_list = data_logger.network_data[network_index]['C_full_list']
     l0_list = data_logger.network_data[network_index]['l0_list']
@@ -117,9 +117,14 @@ def convert_to_log(data_logger, network_index):
         C_full = C_full_list[i]
         l0 = l0_list[i]
         d_log_C_d_log_l0 = np.zeros_like(dC_dl_full)
+        log_diff = np.log(10)/np.log(np.exp(1))
         for k in range(dC_dl_full.shape[0]):
             for l in range(dC_dl_full.shape[1]):
-                d_log_C_d_log_l0[k, l] = dC_dl_full[k, l] * l0[l] / C_full[k]
+                d_log_C_d_log_l0[k, l] = dC_dl_full[k, l]
+                if log_y:
+                    d_log_C_d_log_l0[k, l] = d_log_C_d_log_l0[k, l] / C_full[k] / log_diff
+                if log_x:
+                    d_log_C_d_log_l0[k, l] = d_log_C_d_log_l0[k, l] * l0[l] * log_diff
         d_log_C_d_log_l0_list.append(d_log_C_d_log_l0)
 
     return d_log_C_d_log_l0_list
@@ -1151,7 +1156,7 @@ class GridSampler:
                     
                     # Compute sensitivity derivatives
                     dC_dl = sim.dC_dl_func(C_reduced_current, l0_current, rates, dR_dC_func, dR_dl_func)
-                    dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool=True)
+                    dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool=False)
                     
                     # Extract sign conditions
                     if self.sc_grad_dims is not None:

@@ -9,9 +9,10 @@ import ast
 import os
 import glob
 
-analysis_function = "arc_length"
-analysis_function = "critical_points"
-
+#analysis_function = "arc_length"
+#analysis_function = "critical_points"
+#analysis_function = "mlp_width"
+analysis_function = "pca"
 
 # Create argument parser
 parser = argparse.ArgumentParser(description="Analyze existing data from input directory and save results to output directory.")
@@ -41,33 +42,56 @@ n_networks = len(data_logger.network_data)
 
 print(f"Found {n_networks} networks to analyze")
 
-for network_index in range(n_networks):
-    print(f"Analyzing network {network_index + 1}/{n_networks}")
+whole_data_functions = ["pca"]
+
+time_start = time.time()
+if analysis_function in whole_data_functions:
+    (target_node, target_node_idx, n_paths) = count_paths_to_target(data_logger, 0, source_node='R0')
+    network_data = data_logger.get_network_by_index(0)
+    species_names = network_data['network_params']['species_names']
     
-    network_data = data_logger.get_network_by_index(network_index)
-    network_params = network_data['network_params']
-    species_names = network_params['species_names']
-    NR =int(sum('R' in name for name in species_names))
-    NS =int(sum('S' in name for name in species_names) // 2)
-    target_node = 'S'+str(NS-1)
-    adjacency_matrix = network_data['adjacency_matrix']
-    input_substrates_list = network_data['input_substrates_list']
-    C_full_list = network_data['C_full_list']
-    l0_list = network_data['l0_list']
-    log_l0_x = [np.log10(l0[0]) for l0 in l0_list]
-    
-    # Perform analysis based on the specified function
-    # Map analysis functions to their implementations
     analysis_functions = {
-        "arc_length": lambda: normalized_arc_length(log_l0_x, C_full_list),
-        "num_sign_changes": lambda: count_conservation_group_changes(network_data),
-        "mlp_width": lambda: select_best_mlp_width(log_l0_x, C_full_list, width_range=(2, 10), normalize_x=True, random_state=42, r2_threshold = 0.99, quiet = True),
-        "sign_conditions": lambda: count_sign_conditions(network_data),
-        "critical_points": lambda: count_critical_points(network_data, target_node_idx = species_names.index(target_node), l0_list = l0_list, fd_comparison = False)
-        
+        "pca": lambda: fit_pca_on_networks(data_logger, n_points=100, n_samples=50000, target_species_idx = species_names.index(target_node))
     }
 
-    if analysis_function in analysis_functions:
+    result = analysis_functions[analysis_function]()
+    results_logger.log_network(
+        network_index=0,
+        analysis_type=analysis_function,
+        result_value=result,
+        param1=args.param1,
+        param2=args.param2 if args.param2 is not None else None
+    )
+
+else:
+    for network_index in range(n_networks):
+        if network_index % 100 == 0:
+            print(f"Analyzing network {network_index + 1}/{n_networks}")
+        
+        network_data = data_logger.get_network_by_index(network_index)
+        network_params = network_data['network_params']
+        # species_names = network_params['species_names']
+        # NR =int(sum('R' in name for name in species_names))
+        # NS =int(sum('S' in name for name in species_names) // 2)
+        # target_node = 'S'+str(NS-1)
+        (target_node, target_node_idx, n_paths) = count_paths_to_target(data_logger, network_index, source_node='R0')
+        adjacency_matrix = network_data['adjacency_matrix']
+        input_substrates_list = network_data['input_substrates_list']
+        C_full_list = network_data['C_full_list']
+        l0_list = network_data['l0_list']
+        log_l0_x = [np.log10(l0[0]) for l0 in l0_list]
+        
+        # Perform analysis based on the specified function
+        # Map analysis functions to their implementations
+        analysis_functions = {
+            "arc_length": lambda: normalized_arc_length(log_l0_x, C_full_list),
+            "num_sign_changes": lambda: count_conservation_group_changes(network_data),
+            "mlp_width": lambda: select_best_mlp_width(log_l0_x, C_full_list, width_range=(2, 10), normalize_x=True, random_state=42, r2_threshold = 0.99, quiet = True)['best_width'],
+            "sign_conditions": lambda: count_sign_conditions(network_data),
+            "critical_points": lambda: count_critical_points(network_data, target_node_idx = species_names.index(target_node), l0_list = l0_list, fd_comparison = False) 
+        }
+
+        #if analysis_function in analysis_functions:
         result = analysis_functions[analysis_function]()
         results_logger.log_network(
             network_index=network_index,
@@ -76,6 +100,9 @@ for network_index in range(n_networks):
             param1=args.param1,
             param2=args.param2 if args.param2 is not None else None
         )
+        
+time_end = time.time()
+print(f"Time taken: {time_end - time_start} seconds")
 
 # save one network copy
 results_logger.log_network(**data_logger.get_network_by_index(0))

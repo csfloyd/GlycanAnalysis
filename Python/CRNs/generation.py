@@ -259,7 +259,7 @@ def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-8):
     return result.x
 
 
-def generate_feedforward_signaling_network(NR, NS_vec, include_reverse=False, include_uncatalyzed=True):
+def generate_feedforward_signaling_network(NR, NS_vec, include_reverse=True, include_uncatalyzed=True):
     """
     Generate a signaling network with NR receptors and layers of ligands specified by NS_vec.
     
@@ -329,7 +329,7 @@ def generate_feedforward_signaling_network(NR, NS_vec, include_reverse=False, in
     return species_names, reaction_strings, L
 
 
-def generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, p_f = 1, include_reverse=False, include_uncatalyzed=True, seed=None):
+def generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, p_f = 1, include_reverse=True, include_uncatalyzed=True, seed=None):
     """
     Generate a layered feedforward signaling network with NR receptors and layers of ligands specified by NS_vec.
     Similar interface to generate_dag_signaling_network but maintains layered structure.
@@ -862,7 +862,6 @@ def generate_random_dimerization_network(NS, prob, include_reverse=False):
     
 
     # Get indices of all species containing 'A'
-    A_indices = [i for i, name in enumerate(species_names) if 'A' in name]
     L = []
     for monomer in monomer_names:
         mon_indices = [i for i, name in enumerate(species_names) if monomer in name]
@@ -872,3 +871,70 @@ def generate_random_dimerization_network(NS, prob, include_reverse=False):
     L = np.array(L)
     
     return species_names, reaction_strings, L
+
+def generate_random_first_order_network(n_nodes, input_reactions_list, prob, extra_reactions = [], include_reverse=False):
+    """
+    Generate a random signaling network with NR receptors and NS ligands, where NS_in ligands are randomly selected as inputs.
+    
+    Args:
+        NR: Number of receptors
+        n_nodes: Total number of ligands
+        NS_in: Number of input ligands that can be activated by receptors
+        prob: Probability of including a catalytic activation between any two ligands
+        include_reverse: Whether to include reverse reactions
+        include_uncatalyzed: Whether to include uncatalyzed activation/deactivation
+        
+    Returns:
+        species_names: List of species names
+        reaction_strings: List of reaction strings
+        L: Conservation law matrix
+    """
+    reaction_strings = []
+    species_names = []
+    alphabet = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L']
+    monomer_names = [f'{alphabet[i]}' for i in range(n_nodes)]
+
+    NR = len(input_reactions_list)
+    
+    # Generate species names
+    for i in range(NR):
+        species_names.append(f'R{i}')
+    
+    for i in range(n_nodes):
+        for j in range(i+1, n_nodes):
+            if np.random.rand() < prob:
+                reac = f'{monomer_names[i]} -> {monomer_names[j]}'
+                reaction_strings.append(reac)
+                if include_reverse:
+                    reac = f'{monomer_names[j]} -> {monomer_names[i]}'
+                    reaction_strings.append(reac)
+    
+    species_names = species_names + monomer_names
+    reaction_strings = reaction_strings + extra_reactions
+    for i in range(NR):
+        input_reactions = input_reactions_list[i]
+        reaction_strings = reaction_strings + input_reactions
+
+
+#    for i in range(NR):
+#     input_reactions = input_reactions_list[i]
+#     for reaction in input_reactions:
+#         parts = reaction.split('->')
+#         reac = f'R{i}+{parts[0]} -> R{i}+{parts[1]}'
+#         reaction_strings.append(reac)
+
+
+    
+    # Generate conservation law matrix
+    L = np.zeros((NR + 1, len(species_names)))
+    
+    # Conservation laws for receptors (each receptor is conserved)
+    for i in range(NR):
+        L[i, i] = 1
+    
+    # Conservation laws for substrates (each substrate has conserved total: S{j}s + S{j})
+    L[NR, NR:] = np.ones(n_nodes)
+    
+    
+    return species_names, reaction_strings, L
+
