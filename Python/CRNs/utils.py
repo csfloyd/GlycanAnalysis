@@ -661,7 +661,7 @@ class AdaptiveSampler:
             l0 = self.default_l0.copy()
             # Sample only the specified input dimensions
             for dim in self.input_dims:
-                l0[dim] = np.exp(np.random.uniform(np.log(self.l0_range[0]), np.log(self.l0_range[1])))
+                l0[dim] =10**(np.random.uniform(np.log(self.l0_range[0]), np.log(self.l0_range[1])))
         
             if self.profiler:
                 self.profiler.start_timer("adaptive_nnls")

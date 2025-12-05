@@ -259,74 +259,74 @@ def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-8):
     return result.x
 
 
-def generate_feedforward_signaling_network(NR, NS_vec, include_reverse=True, include_uncatalyzed=True):
-    """
-    Generate a signaling network with NR receptors and layers of ligands specified by NS_vec.
+# def generate_feedforward_signaling_network(NR, NS_vec, include_reverse=True, include_uncatalyzed=True):
+#     """
+#     Generate a signaling network with NR receptors and layers of ligands specified by NS_vec.
     
-    Args:
-        NR: Number of receptors
-        NS_vec: List specifying number of ligands in each layer
+#     Args:
+#         NR: Number of receptors
+#         NS_vec: List specifying number of ligands in each layer
         
-    Returns:
-        species_names: List of species names
-        reaction_strings: List of reaction strings
-        L: Conservation law matrix
-    """
-    reaction_strings = []
-    species_names = []
+#     Returns:
+#         species_names: List of species names
+#         reaction_strings: List of reaction strings
+#         L: Conservation law matrix
+#     """
+#     reaction_strings = []
+#     species_names = []
 
-    # Generate species names
-    for i in range(NR):
-        species_names.append(str(f'R{i}'))
-    for l in range(len(NS_vec)):
-        for j in range(NS_vec[l]):
-            species_names.append(f'S{l}{j}s') # first number is layer, second is index
-            species_names.append(f'S{l}{j}') # s indicates that it is in active form 
+#     # Generate species names
+#     for i in range(NR):
+#         species_names.append(str(f'R{i}'))
+#     for l in range(len(NS_vec)):
+#         for j in range(NS_vec[l]):
+#             species_names.append(f'S{l}{j}s') # first number is layer, second is index
+#             species_names.append(f'S{l}{j}') # s indicates that it is in active form 
 
-    # Generate receptor-ligand reactions
-    for i in range(NR):
-        NS = NS_vec[0]
-        for j in range(NS):
-            reac = f'R{i}+S0{j}s -> R{i}+S0{j}'
-            reaction_strings.append(reac)
-            if include_reverse:
-                reac = f'R{i}+S0{j} -> R{i}+S0{j}s'
-                reaction_strings.append(reac)
+#     # Generate receptor-ligand reactions
+#     for i in range(NR):
+#         NS = NS_vec[0]
+#         for j in range(NS):
+#             reac = f'R{i}+S0{j}s -> R{i}+S0{j}'
+#             reaction_strings.append(reac)
+#             if include_reverse:
+#                 reac = f'R{i}+S0{j} -> R{i}+S0{j}s'
+#                 reaction_strings.append(reac)
                 
 
-    # Generate ligand-ligand reactions between layers
-    for l in range(len(NS_vec)-1):
-        NS = NS_vec[l+1]
-        for i in range(NS_vec[0]):
-            for j in range(NS):
-                reac = f'S{l}{i}+S{l+1}{j}s -> S{l}{i}+S{l+1}{j}'
-                reaction_strings.append(reac)
-                if include_reverse:
-                    reac = f'S{l}{i} + S{l+1}{j} -> S{l}{i} + S{l+1}{j}s'
-                    reaction_strings.append(reac)
+#     # Generate ligand-ligand reactions between layers
+#     for l in range(len(NS_vec)-1):
+#         NS = NS_vec[l+1]
+#         for i in range(NS_vec[0]):
+#             for j in range(NS):
+#                 reac = f'S{l}{i}+S{l+1}{j}s -> S{l}{i}+S{l+1}{j}'
+#                 reaction_strings.append(reac)
+#                 if include_reverse:
+#                     reac = f'S{l}{i} + S{l+1}{j} -> S{l}{i} + S{l+1}{j}s'
+#                     reaction_strings.append(reac)
 
-    # Generate ligand-ligand reactions between layers
-    if include_uncatalyzed:
-        for l in range(len(NS_vec)):
-            for j in range(NS_vec[l]):
-                reac = f'S{l}{j}s -> S{l}{j}'
-                reaction_strings.append(reac)
-                if include_reverse:
-                    reac = f'S{l}{j} -> S{l}{j}s'
-                    reaction_strings.append(reac)
+#     # Generate ligand-ligand reactions between layers
+#     if include_uncatalyzed:
+#         for l in range(len(NS_vec)):
+#             for j in range(NS_vec[l]):
+#                 reac = f'S{l}{j}s -> S{l}{j}'
+#                 reaction_strings.append(reac)
+#                 if include_reverse:
+#                     reac = f'S{l}{j} -> S{l}{j}s'
+#                     reaction_strings.append(reac)
 
-    # Generate conservation law matrix
-    L = np.zeros((NR + np.sum(NS_vec), len(species_names)))
-    for i in range(NR):
-        L[i, i] = 1
-    flat_idx = 0
-    for l in range(len(NS_vec)):
-        for j in range(NS_vec[l]):
-            L[NR + flat_idx, species_names.index(f'S{l}{j}s')] = 1
-            L[NR + flat_idx, species_names.index(f'S{l}{j}')] = 1
-            flat_idx += 1
+#     # Generate conservation law matrix
+#     L = np.zeros((NR + np.sum(NS_vec), len(species_names)))
+#     for i in range(NR):
+#         L[i, i] = 1
+#     flat_idx = 0
+#     for l in range(len(NS_vec)):
+#         for j in range(NS_vec[l]):
+#             L[NR + flat_idx, species_names.index(f'S{l}{j}s')] = 1
+#             L[NR + flat_idx, species_names.index(f'S{l}{j}')] = 1
+#             flat_idx += 1
 
-    return species_names, reaction_strings, L
+#     return species_names, reaction_strings, L
 
 
 def generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, p_f = 1, include_reverse=True, include_uncatalyzed=True, seed=None):
@@ -643,6 +643,31 @@ def generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=False, incl
     
     return species_names, reaction_strings, L, adjacency_matrix, input_substrates_list
 
+def add_recurrent_connections(adjacency_matrix, reaction_strings, include_reverse, input_substrates_list, NR, NS, p_r, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    
+    G_original = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
+    adjacency_matrix_copy = adjacency_matrix.copy()
+    n_paths = count_simple_paths(G_original, f'R0', f'S{NS-1}')
+    for i in range(1, NS):
+        for j in range(i):
+            if np.random.rand() < p_r:
+                adjacency_matrix_copy[i, j] = 1
+                G = get_digraph_from_adjacency_matrix(adjacency_matrix_copy, input_substrates_list, NR, NS)
+                if count_simple_paths(G, f'R0', f'S{NS-1}') != n_paths:
+                    adjacency_matrix_copy[i, j] = 0
+
+    for i in range(NR):
+        for j in input_substrates_list[i]:
+            reac = f'R{i}+S{j}s -> R{i}+S{j}'
+            reaction_strings.append(reac)
+            if include_reverse:
+                reac = f'R{i}+S{j} -> R{i}+S{j}s'
+                reaction_strings.append(reac)
+
+    return reaction_strings, adjacency_matrix_copy
+
 def generate_specified_dag_signaling_network(adjacency_matrix, input_substrates_list, include_reverse=False, include_uncatalyzed=True, seed=None):
     """
     Generate a signaling network based on a directed acyclic graph (DAG) structure.
@@ -722,6 +747,100 @@ def generate_specified_dag_signaling_network(adjacency_matrix, input_substrates_
     
     return species_names, reaction_strings, L
 
+def expand_catalyzed_reactions(species_names, reaction_strings, L):
+    """
+    Expand catalyzed reactions into elementary steps with intermediate complexes.
+    
+    Args:
+        species_names: List of species names
+        reaction_strings: List of reaction strings
+        L: Linkage matrix (numpy array)
+        
+    Returns:
+        tuple: (new_species_names, new_reaction_strings, new_L)
+            - new_species_names: Updated list of species names including intermediates
+            - new_reaction_strings: Updated list of reaction strings with expanded reactions
+            - new_L: Updated linkage matrix
+    """
+    def has_catalyst(reaction_string):
+        """
+        Check if any species appears on both sides of the reaction.
+        
+        Args:
+            reaction_string: Reaction string like 'S0+S1s -> S0+S1'
+            
+        Returns:
+            bool: True if any species appears on both sides
+        """
+        # Split into reactants and products
+        parts = reaction_string.split('->')
+        if len(parts) != 2:
+            return False
+        
+        reactants_str = parts[0].strip()
+        products_str = parts[1].strip()
+        
+        # Parse species from each side
+        reactants = set(s.strip() for s in reactants_str.split('+'))
+        products = set(s.strip() for s in products_str.split('+'))
+        
+        # Check if any species appears in both
+        return len(reactants & products) > 0
+
+
+    def split_catalyzed_reaction(reaction_string):
+        """
+        Split a catalyzed reaction into two elementary steps with an intermediate complex.
+        Assumes a catalyst species appears on both sides.
+        
+        Args:
+            reaction_string: Reaction string like 'S0+S1s -> S0+S1'
+            
+        Returns:
+            tuple: (intermediate_name, reaction1, reaction2)
+                - intermediate_name: Name of the intermediate complex (e.g., 'S0_S1s')
+                - reaction1: Complex formation reaction (e.g., 'S0+S1s -> S0_S1s')
+                - reaction2: Complex dissociation reaction (e.g., 'S0_S1s -> S0+S1')
+        """
+        # Split into reactants and products
+        parts = reaction_string.split('->')
+        reactants_str = parts[0].strip()
+        products_str = parts[1].strip()
+        
+        # Parse species from each side
+        reactants = [s.strip() for s in reactants_str.split('+')]
+        products = [s.strip() for s in products_str.split('+')]
+        
+        # Create intermediate name by joining all reactants with underscores
+        intermediate_name = '_'.join(reactants)
+        
+        # Create reaction 1: reactants -> intermediate (complex formation)
+        reaction1 = f"{'+'.join(reactants)} -> {intermediate_name}"
+        
+        # Create reaction 2: intermediate -> products (complex dissociation)
+        reaction2 = f"{intermediate_name} -> {'+'.join(products)}"
+        
+        return intermediate_name, reaction1, reaction2, list(set(reactants) | set(products))
+
+    new_species_names = species_names.copy()
+    new_reaction_strings = reaction_strings.copy()
+    new_L = L.copy()
+    for reaction_string in reaction_strings:
+        if has_catalyst(reaction_string):
+            intermediate_name, reaction1, reaction2, involved_species = split_catalyzed_reaction(reaction_string)
+            involved_indices = [species_names.index(species) for species in involved_species]
+            new_species_names.append(intermediate_name)
+            new_reaction_strings.remove(reaction_string)
+            new_reaction_strings.append(reaction1)
+            new_reaction_strings.append(reaction2)
+            new_l = np.zeros(len(new_L))
+            for i in range(len(new_L)):
+                if L[i, involved_indices].sum() > 0:
+                    new_l[i] = 1
+            new_L = np.column_stack([new_L, new_l])
+    
+    return new_species_names, new_reaction_strings, new_L
+
 def get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS):
     # Create a directed graph
     G = nx.DiGraph()
@@ -753,7 +872,7 @@ def count_simple_paths(G, source, target):
     except nx.NetworkXNoPath:
         return 0
 
-def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR, NS):
+def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR, NS, num_outs = 1,node_size=600, arrow_size=25, font_size=12, ax=None):
     """
     Visualize the DAG signaling network including receptor connections.
     
@@ -762,11 +881,12 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
         input_substrates_list: List of substrate indices that are input substrates
         NR: Number of receptors
         NS: Number of substrates
+        ax: Optional matplotlib axis to plot into. If None, creates a new figure and axis.
 
         title: Title for the plot
         
     Returns:
-        matplotlib figure object
+        matplotlib figure object (if ax is None) or the provided axis
     """
     import matplotlib.pyplot as plt
     import networkx as nx
@@ -774,8 +894,13 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
     # Create a directed graph
     G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
        
-    # Create the plot
-    fig, ax = plt.subplots(figsize=(6, 6))
+    # Create the plot if axis not provided
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        return_fig = True
+    else:
+        fig = ax.get_figure()
+        return_fig = False
 
     #print(nx.is_directed_acyclic_graph(G))
     if nx.is_directed_acyclic_graph(G):
@@ -795,17 +920,21 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
             pos[node] = rotation_matrix @ np.array(pos[node])
     else:
         # If not DAG, use spring layout
-        pos = nx.spring_layout(G, k=1, iterations=50)
+        #pos = nx.spring_layout(G, k=2, iterations=50)
+        pos = nx.circular_layout(G)
     
     # Draw nodes
     receptor_nodes = [node for node in G.nodes() if node.startswith('R')]
     substrate_nodes = [node for node in G.nodes() if node.startswith('S')]
     
     nx.draw_networkx_nodes(G, pos, nodelist=receptor_nodes, 
-                          node_color='lightblue', node_size=600, 
+                          node_color='lightblue', node_size=node_size, 
                           node_shape='s', ax=ax, label='Receptors')
-    nx.draw_networkx_nodes(G, pos, nodelist=substrate_nodes, 
-                          node_color='pink', node_size=600, 
+    nx.draw_networkx_nodes(G, pos, nodelist=substrate_nodes[:-num_outs], 
+                          node_color='pink', node_size=node_size, 
+                          node_shape='o', ax=ax, label='Substrates')
+    nx.draw_networkx_nodes(G, pos, nodelist=substrate_nodes[-num_outs:], 
+                          node_color='lightgreen', node_size=node_size, 
                           node_shape='o', ax=ax, label='Substrates')
     
     # Draw edges with different colors
@@ -813,17 +942,20 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
     substrate_edges = [(u, v) for u, v, d in G.edges(data=True) if d['edge_type'] == 'substrate']
     
     nx.draw_networkx_edges(G, pos, edgelist=receptor_edges, 
-                          edge_color='blue', arrows=True, arrowsize=25, 
-                          ax=ax, label='Receptor activation', connectionstyle="arc3,rad=-0.3")
+                          edge_color='blue', arrows=True, arrowsize=arrow_size, 
+                          ax=ax, label='Receptor activation', connectionstyle="arc3,rad=-0.4")
     nx.draw_networkx_edges(G, pos, edgelist=substrate_edges, 
-                          edge_color='red', arrows=True, arrowsize=25, 
-                          ax=ax, label='Substrate catalysis', connectionstyle="arc3,rad=0.3")
+                          edge_color='red', arrows=True, arrowsize=arrow_size, 
+                          ax=ax, label='Substrate catalysis', connectionstyle="arc3,rad=0.4")
     
     # Draw labels
-    nx.draw_networkx_labels(G, pos, ax=ax)
+    nx.draw_networkx_labels(G, pos, ax=ax, font_size=font_size, font_family='Arial')
     
-    plt.tight_layout()
-    return fig
+    if return_fig:
+        plt.tight_layout()
+        return fig
+    else:
+        return ax
 
 def generate_random_dimerization_network(NS, prob, include_reverse=False):
     """

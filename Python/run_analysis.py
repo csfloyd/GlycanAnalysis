@@ -10,9 +10,10 @@ import os
 import glob
 
 #analysis_function = "arc_length"
+analysis_function = "total_absolute_curvature"
 #analysis_function = "critical_points"
 #analysis_function = "mlp_width"
-analysis_function = "pca"
+#analysis_function = "pca"
 
 # Create argument parser
 parser = argparse.ArgumentParser(description="Analyze existing data from input directory and save results to output directory.")
@@ -70,10 +71,10 @@ else:
         
         network_data = data_logger.get_network_by_index(network_index)
         network_params = network_data['network_params']
-        # species_names = network_params['species_names']
-        # NR =int(sum('R' in name for name in species_names))
-        # NS =int(sum('S' in name for name in species_names) // 2)
-        # target_node = 'S'+str(NS-1)
+        species_names = network_params['species_names']
+        NR =int(sum('R' in name for name in species_names))
+        NS =int(sum('S' in name for name in species_names) // 2)
+        target_node = 'S'+str(NS-1)
         (target_node, target_node_idx, n_paths) = count_paths_to_target(data_logger, network_index, source_node='R0')
         adjacency_matrix = network_data['adjacency_matrix']
         input_substrates_list = network_data['input_substrates_list']
@@ -85,10 +86,11 @@ else:
         # Map analysis functions to their implementations
         analysis_functions = {
             "arc_length": lambda: normalized_arc_length(log_l0_x, C_full_list),
+            "total_absolute_curvature": lambda: total_absolute_curvatures(log_l0_x, C_full_list),
             "num_sign_changes": lambda: count_conservation_group_changes(network_data),
             "mlp_width": lambda: select_best_mlp_width(log_l0_x, C_full_list, width_range=(2, 10), normalize_x=True, random_state=42, r2_threshold = 0.99, quiet = True)['best_width'],
             "sign_conditions": lambda: count_sign_conditions(network_data),
-            "critical_points": lambda: count_critical_points(network_data, target_node_idx = species_names.index(target_node), l0_list = l0_list, fd_comparison = False) 
+            "critical_points": lambda: count_critical_points(network_data, target_node_idx = species_names.index(target_node), l0_list = l0_list, fd_comparison = False, eps = 1e-10) 
         }
 
         #if analysis_function in analysis_functions:

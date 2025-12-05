@@ -11,9 +11,9 @@ import ast
 # Create argument parser
 parser = argparse.ArgumentParser(description="SLURM job script with arguments.")
 
-arg1_type = str
+arg1_type = int
 # Define command-line arguments
-parser.add_argument("--param1", type=arg1_type, required=True, help="An integer parameter")
+parser.add_argument("--param1", type=int, required=True, help="An integer parameter")
 parser.add_argument("--param2", type=int, required=False, help="An integer parameter")
 parser.add_argument("--output", type=str, required=True, help="A string parameter")
 
@@ -22,43 +22,74 @@ args = parser.parse_args()
 
 output_dir = args.output
 
-#seed = args.param2
-seed = 40
+#seed = args.param1
+seed = 42
 
-### Signaling network 
-NR = 1
-# NS = 3
-# p_f = 0.8
-p_r = 0
-# Convert string to list of integers
-NS_vec = [int(digit) for digit in args.param1]
-NS_vec.append(1)
-NS = sum(NS_vec)
+if seed is not None:
+    np.random.seed(seed)
+    random.seed(seed)
+
+sample_network_bool = False
+
+if sample_network_bool:
+    ### Signaling network 
+    NR = 1
+    # NS = 3
+    # p_f = 0.8
+    p_r = args.param2
+    # Convert string to list of integers
+    if args.param1 == "n":
+        var = ""
+    else:
+        var = args.param1
+
+    #NS_vec = [int(digit) for digit in var]
+    #NS_vec.append(1)
+    #NS = sum(NS_vec)
+
+    p_f = 0.4
+    NS = 4
+
+    species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=False, include_uncatalyzed=True)
+    #species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, include_reverse=False, include_uncatalyzed=True)
+
+else:
+    NS = 4
+    NR = 1
+    save_path = "/project/svaikunt/csfloyd/TrainingCRNs/Python/SavedNetworks/"
+    sub_path = "NS" + str(NS) + ".pkl"  # Replace with your desired path
+    filepath = save_path + sub_path
+    with open(filepath, 'rb') as f:
+        networks = pickle.load(f)
+
+    n_paths = args.param1
+    sample_idx = args.param2
+    adjacency_matrix = networks[n_paths][sample_idx]['adjacency_matrix_0']
+    input_substrates_list = networks[n_paths][sample_idx]['input_substrates_list']
+
+    species_names, reaction_strings, L = generate_specified_dag_signaling_network(adjacency_matrix, input_substrates_list, include_reverse=False, include_uncatalyzed=True)
+
+
+
+#species_names, reaction_strings, L = expand_catalyzed_reactions(species_names, reaction_strings, L)
+
 target_node = 'S'+str(NS-1)
 
-E_range = 8.0
-B_range = 8.0
-F_range = 8.0
+E_range = 10.0
+B_range = 10.0
+F_range = 10.0
 C0 = 1
 beta = 1
-l0_range = (1e-3, 1e3)
+l0_range = (1e-9, 1e9)
+l0_range_sub = (1e0, 1e0)
 
-
-n_graph_samples = 10000
+n_graph_samples = 50000
 
 t_span = (0, 10000)
 num_points = 10000
 int_method = 'LSODA'
 r_tol = 1e-12  
 a_tol = 1e-12
-
-
-if seed is not None:
-    np.random.seed(seed)
-    random.seed(seed)
-
-#species_names, reaction_strings, L, adjacency_matrix, input_substrates = generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=True, include_uncatalyzed=True)
-species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, include_reverse=False, include_uncatalyzed=True)
 
 G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
 target_node = 'S'+str(NS-1)
@@ -80,13 +111,13 @@ n_lcs = r_n.n_lcs
 n_cons = len(L)
 r_n_base = r_n
 
-lhs_bool = True
+lhs_bool = False
 
 if lhs_bool:
     E_lists = [(-E_range, E_range) for _ in range(n_species)]
     B_lists = [(-B_range, B_range) for _ in range(n_reactions)]
     F_lists = [(-F_range, F_range) for _ in range(n_reactions)]
-    l0_lists = [(np.log10(l0_range[0]), np.log10(l0_range[1])) for _ in range(n_cons)]
+    l0_lists = [(np.log10(l0_range_sub[0]), np.log10(l0_range_sub[1])) for _ in range(n_cons)]
     ranges = E_lists + B_lists + F_lists + l0_lists
     samples = list(latin_hypercube_sampling(ranges, n_graph_samples, seed))
 
@@ -106,7 +137,7 @@ sampler = GridSampler(
     default_l0=default_l0,
     sc_grad_dims=sc_grad_dims,
     l0_range=l0_range,
-    l0_grid_size=50,
+    l0_grid_size=100,
     grid_dim=1,
     timeout_seconds=5,
     profiler=profiler,
@@ -138,17 +169,14 @@ for iter in range(n_graph_samples):
             B_list = sample[n_species:n_species+n_reactions]
             F_list = sample[n_species+n_reactions:n_species+n_reactions+n_reactions]
             reac_rates = get_rates_from_exponents(r_n, E_list, B_list, F_list, C0, beta)
-            r_n.update_rates(reac_rates)
-
-            l0_list = 10**np.array(sample[n_species+n_reactions+n_reactions:])
-            sampler.default_l0 = default_l0
+            default_l0 = 10**np.array(sample[n_species+n_reactions+n_reactions:])
 
         else:
             reac_rates = generate_thermodynamic_rates(r_n, C0, beta, E_range, B_range, F_range)
-            r_n.update_rates(reac_rates)
-
-            default_l0 = np.exp(np.random.uniform(np.log(l0_range[0]), np.log(l0_range[1]), n_cons))
-            sampler.default_l0 = default_l0
+            default_l0 = 10**(np.random.uniform(np.log(l0_range_sub[0]), np.log(l0_range_sub[1]), n_cons))
+        
+        r_n.update_rates(reac_rates)
+        sampler.default_l0 = default_l0
 
         profiler.end_timer("network_generation")
     except Exception as e:

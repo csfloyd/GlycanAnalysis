@@ -216,6 +216,62 @@ def normalized_arc_length(x_vals, y_vals):
 
     return L / chord_length
 
+def total_absolute_curvatures(x_vals, y_vals):
+    """
+    Compute the total absolute curvature of a parametric curve using finite differences.
+
+    Curvature κ = |x'y'' - y'x''| / (x'^2 + y'^2)^(3/2)
+    Total absolute curvature = integral of |κ| ds along the curve
+
+    Returns:
+        tuple: (raw_curvature, normalized_curvature)
+            - raw_curvature: sum of |κ| * ds over all segments
+            - normalized_curvature: raw_curvature / total_arc_length
+    """
+    x = np.asarray(x_vals, dtype=float)
+    y = np.asarray(y_vals, dtype=float)
+
+    if x.size < 3:
+        return 0.0, 0.0
+
+    # Compute first derivatives using central differences (forward/backward at endpoints)
+    dx_dt = np.gradient(x)
+    dy_dt = np.gradient(y)
+
+    # Compute second derivatives using central differences
+    d2x_dt2 = np.gradient(dx_dt)
+    d2y_dt2 = np.gradient(dy_dt)
+
+    # Compute curvature at each point: κ = |x'y'' - y'x''| / (x'^2 + y'^2)^(3/2)
+    numerator = np.abs(dx_dt * d2y_dt2 - dy_dt * d2x_dt2)
+    denominator = (dx_dt**2 + dy_dt**2)**(3/2)
+    
+    # Avoid division by zero
+    denominator = np.where(denominator < 1e-12, 1e-12, denominator)
+    curvature = numerator / denominator
+
+    # Compute arc length for each segment
+    dx = np.diff(x)
+    dy = np.diff(y)
+    segment_lengths = np.sqrt(dx**2 + dy**2)
+    
+    # Average curvature over each segment (trapezoidal rule)
+    curvature_avg = (curvature[:-1] + curvature[1:]) / 2.0
+    
+    # Total absolute curvature (raw value)
+    total_curvature_raw = np.sum(curvature_avg * segment_lengths)
+    
+    # Total arc length
+    total_arc_length = np.sum(segment_lengths)
+    
+    # Normalized by arc length
+    if total_arc_length > 0:
+        total_curvature_normalized = total_curvature_raw / total_arc_length
+    else:
+        total_curvature_normalized = 0.0
+
+    return total_curvature_raw, total_curvature_normalized
+
 
 
 
@@ -375,7 +431,7 @@ def plot_mlp_fits(x_data, y_data, results, max_show=9):
     plt.show()
 
 
-def count_critical_points(network_data, target_node_idx=None, l0_list=None, fd_comparison = False, threshold=0.2, pad=4):
+def count_critical_points(network_data, target_node_idx=None, l0_list=None, fd_comparison = False, threshold=0.2, pad=4, eps = 1e-8):
     """
     Count critical points (sign changes) in derivatives for a given network.
     
@@ -389,7 +445,7 @@ def count_critical_points(network_data, target_node_idx=None, l0_list=None, fd_c
     l0_list: Optional list of l0 values (overrides network_data['l0_list'])
     threshold: Threshold for finite difference consistency check
     pad: Number of points to skip at beginning and end for consistency check
-    
+    eps: Threshold for small derivatives
     Returns:
     int: Number of sign changes (critical points) if consistent, None if inconsistent
     """
@@ -446,7 +502,7 @@ def count_critical_points(network_data, target_node_idx=None, l0_list=None, fd_c
         # Find sign changes
         sign_change_indices = []
         for i in range(len(d_vals) - 1):
-            if d_vals[i] * d_vals[i + 1] < 0:  # Sign change occurs
+            if (d_vals[i] * d_vals[i+1] < 0) and (np.abs(d_vals[i] - d_vals[i+1]) > eps):  # Sign change occurs
                 sign_change_indices.append(i)
         
         return (len(sign_change_indices), max_log_deriv)
