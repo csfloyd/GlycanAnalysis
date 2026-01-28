@@ -23,7 +23,7 @@ args = parser.parse_args()
 output_dir = args.output
 
 #seed = args.param1
-seed = 42
+seed = 40
 
 if seed is not None:
     np.random.seed(seed)
@@ -54,8 +54,8 @@ if sample_network_bool:
     #species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, include_reverse=False, include_uncatalyzed=True)
 
 else:
-    NS = 4
     NR = 1
+    NS = 4
     save_path = "/project/svaikunt/csfloyd/TrainingCRNs/Python/SavedNetworks/"
     sub_path = "NS" + str(NS) + ".pkl"  # Replace with your desired path
     filepath = save_path + sub_path
@@ -64,7 +64,8 @@ else:
 
     n_paths = args.param1
     sample_idx = args.param2
-    adjacency_matrix = networks[n_paths][sample_idx]['adjacency_matrix_0']
+    ## set p_r below
+    adjacency_matrix = networks[n_paths][sample_idx]['adjacency_matrix_1']
     input_substrates_list = networks[n_paths][sample_idx]['input_substrates_list']
 
     species_names, reaction_strings, L = generate_specified_dag_signaling_network(adjacency_matrix, input_substrates_list, include_reverse=False, include_uncatalyzed=True)
@@ -83,7 +84,7 @@ beta = 1
 l0_range = (1e-9, 1e9)
 l0_range_sub = (1e0, 1e0)
 
-n_graph_samples = 50000
+n_graph_samples = 100000
 
 t_span = (0, 10000)
 num_points = 10000

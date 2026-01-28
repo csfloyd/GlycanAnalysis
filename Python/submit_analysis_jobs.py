@@ -1,15 +1,25 @@
 import os
 import shutil
+import numpy as np
 
-n_params = 1
-dir = "ff_scan_pr1"
+n_params = 2
+#dir = "ff_scan_pr0_n"
+dir = "dag_n_paths_idx_NS4_bigger_pr1"
 inputs_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/" + dir + "/"
 results_base = "/project/svaikunt/csfloyd/TrainingCRNs/AnalyzedData/" + dir + "/"
 
 # Define the range of values for param1 and labels for param2
 
 param1_values = ["1", "2", "3", "4", "11", "22", "33", "44"]
-param2_values = [1,2,3]
+param1_values = ["1", "2", "3", "4", "5"]
+param1_values = [1,2,3,4,5,6,7,8,9,10]
+param1_values = np.array([1,2,3,4,5,6,7,8,9,10])+20
+param2_values = [0.0, 1.0]
+#param1_values = ["n","1","11"]
+param1_values = [1,2,3,4,5]
+param2_values = [1,2,3,4,5,6,7,8,9,10]
+#param1_values = [3]
+#param2_values = [2]
 
 # SLURM job template
 job_template = """#!/bin/bash

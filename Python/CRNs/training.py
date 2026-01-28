@@ -369,7 +369,8 @@ class UnifiedTrainer:
                  beta2: float = 0.999,
                  eps: float = 1e-8,
                  max_grad_norm: float = 50.0,
-                 loss_type: str = 'cross_entropy'):
+                 loss_type: str = 'cross_entropy',
+                 frozen_params: Optional[List[str]] = None):
         """
         Args:
             model: ForwardModel instance (MLPModel or CRNModel)
@@ -379,6 +380,7 @@ class UnifiedTrainer:
             beta1, beta2, eps: Adam hyperparameters
             max_grad_norm: gradient clipping threshold
             loss_type: 'cross_entropy' or 'mse'
+            frozen_params: list of parameter names to freeze (e.g. ['log_l0'])
         """
         self.model = model
         self.optimizer_type = optimizer_type
@@ -389,6 +391,7 @@ class UnifiedTrainer:
         self.eps = eps
         self.max_grad_norm = max_grad_norm
         self.loss_type = loss_type
+        self.frozen_params = set(frozen_params) if frozen_params else set()
         
         # Initialize Adam state for each parameter group
         self.m = {}  # first moment
@@ -461,8 +464,10 @@ class UnifiedTrainer:
         grad_norms = {}
         clipped = False
         
-        # Process each parameter group
-        for name in params:
+        # Process each parameter group (skip frozen params)
+        trainable_params = [name for name in params if name not in self.frozen_params]
+        
+        for name in trainable_params:
             g = grads[name]
             
             # Gradient clipping
@@ -481,7 +486,7 @@ class UnifiedTrainer:
         self.t += 1
         lr_effective = {}
         
-        for name in params:
+        for name in trainable_params:
             g = grads[name]
             lr_param = self.lr_dict.get(name, self.lr)
             lr_effective[name] = lr_param
@@ -511,6 +516,19 @@ class UnifiedTrainer:
         for name in self.m:
             self.m[name] = np.zeros_like(self.m[name])
             self.v[name] = np.zeros_like(self.v[name])
+    
+    def freeze_params(self, param_names: List[str]):
+        """Freeze parameters (stop updating them)."""
+        self.frozen_params.update(param_names)
+    
+    def unfreeze_params(self, param_names: List[str]):
+        """Unfreeze parameters (resume updating them)."""
+        self.frozen_params.difference_update(param_names)
+    
+    def get_trainable_params(self) -> List[str]:
+        """Return list of currently trainable parameter names."""
+        return [name for name in self.model.get_param_shapes().keys() 
+                if name not in self.frozen_params]
 
 
 def run_training(trainer: UnifiedTrainer,
@@ -1397,6 +1415,383 @@ def plot_comparison(histories: Dict[str, TrainingHistory],
         plt.show()
     
     return fig, ax
+
+def generate_lognormal_mixture(
+    n_classes: int,
+    n_samples_per_class: int,
+    input_dim: int,
+    log_means: list,
+    log_variances: list,
+    random_state: int = None
+):
+    if random_state is not None:
+        np.random.seed(random_state)
+    
+    data_list = []
+    for c in range(n_classes):
+        mu = np.array(log_means[c]).flatten()
+        var = log_variances[c]
+        if np.isscalar(var):
+            cov = var * np.eye(input_dim)
+        else:
+            cov = np.diag(np.array(var).flatten())
+        
+        log_samples = np.random.multivariate_normal(mu, cov, n_samples_per_class)
+        samples = np.exp(log_samples)
+        data_list.append([sample for sample in samples])
+    
+    return n_classes, data_list
+
+
+def generate_lognormal_mixture_random_centers(
+    n_classes: int,
+    n_samples_per_class: int,
+    input_dim: int = 1,
+    center_variance: float = 1.0,
+    log_variance: float = 0.3,
+    center_offset: float = 3.0,
+    random_state: int = None
+):
+    """
+    Both center_variance and log_variance are TOTAL variances.
+    They are divided by input_dim to get per-dimension variance,
+    ensuring comparable spread across different dimensionalities.
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+    
+    # Scale both by dimension for comparable total variance
+    per_dim_center_variance = center_variance / input_dim
+    per_dim_log_variance = log_variance / input_dim
+    
+    log_means = []
+    for c in range(n_classes):
+        center = np.random.normal(0, np.sqrt(per_dim_center_variance), size=input_dim)
+        log_mean = center + center_offset
+        log_means.append(log_mean)
+    
+    log_variances = [per_dim_log_variance] * n_classes
+    
+    n_classes_out, data_list = generate_lognormal_mixture(
+        n_classes=n_classes,
+        n_samples_per_class=n_samples_per_class,
+        input_dim=input_dim,
+        log_means=log_means,
+        log_variances=log_variances,
+        random_state=None
+    )
+    
+    return n_classes_out, data_list, log_means
+
+
+def project_data_list(data_list, d):
+
+    projected_data_list = []
+    for class_data in data_list:
+        projected_class = [sample[:d] for sample in class_data]
+        projected_data_list.append(projected_class)
+    return projected_data_list
+
+
+# ============== MULTI-TASK LEARNING ==============
+
+class MultiTaskInputData:
+    """Container for multiple classification tasks with task-specific l0 values."""
+    
+    def __init__(self, tasks: Dict[str, dict]):
+        """
+        Args:
+            tasks: dict mapping task_id -> {
+                'input_data': InputData instance,
+                'l0': np.array of l0 values,
+                'n_classes': int,
+                'log_means': list (optional, for reproducibility)
+            }
+        """
+        self.tasks = tasks
+        self.task_ids = list(tasks.keys())
+        self.n_tasks = len(self.task_ids)
+    
+    def sample_task(self) -> str:
+        """Randomly sample a task id."""
+        import random
+        return random.choice(self.task_ids)
+    
+    def get_task(self, task_id: str) -> dict:
+        """Get task info by id."""
+        return self.tasks[task_id]
+    
+    def get_l0(self, task_id: str) -> np.ndarray:
+        """Get l0 values for a task."""
+        return self.tasks[task_id]['l0']
+    
+    def get_input_data(self, task_id: str):
+        """Get InputData for a task."""
+        return self.tasks[task_id]['input_data']
+    
+    def get_next_training_sample(self, task_id: str, class_idx: int):
+        """Get next training sample from a specific task."""
+        return self.tasks[task_id]['input_data'].get_next_training_sample(class_idx)
+    
+    def get_n_classes(self, task_id: str) -> int:
+        """Get number of classes for a task."""
+        return self.tasks[task_id]['n_classes']
+
+
+def generate_multitask_data(
+    n_tasks: int,
+    n_classes: int,
+    n_samples_per_class: int,
+    input_dim: int,
+    proj_dim: int,
+    center_variance: float,
+    log_variance: float,
+    center_offset: float,
+    n_nodes: int,
+    NR: int,
+    hidden_dim: int,
+    input_data_class,
+    l0_log_mean: float = 0.0,
+    l0_log_std: float = 1.0,
+    base_seed: int = None
+) -> MultiTaskInputData:
+    """
+    Generate multi-task data with random l0 values for internal nodes.
+    
+    Args:
+        n_tasks: number of tasks to generate
+        n_classes: number of classes per task
+        n_samples_per_class: samples per class
+        input_dim: original input dimension (before projection)
+        proj_dim: projected dimension (= NR)
+        center_variance: variance for class center generation
+        log_variance: variance within each class
+        center_offset: offset for log means
+        n_nodes: total number of nodes in graph
+        NR: number of input (receptor) nodes
+        hidden_dim: number of hidden nodes
+        input_data_class: InputData class to use for wrapping data
+        l0_log_mean: mean of log(l0) for internal nodes
+        l0_log_std: std of log(l0) for internal nodes
+        base_seed: random seed for reproducibility
+        
+    Returns:
+        MultiTaskInputData container
+    """
+    import random as random_module
+    
+    tasks = {}
+    
+    for task_idx in range(n_tasks):
+        # Set seed for this task if base_seed provided
+        task_seed = base_seed + task_idx if base_seed is not None else None
+        
+        if task_seed is not None:
+            np.random.seed(task_seed)
+            random_module.seed(task_seed)
+        
+        # Generate data clouds for this task
+        _, data_list, log_means = generate_lognormal_mixture_random_centers(
+            n_classes=n_classes,
+            n_samples_per_class=n_samples_per_class,
+            input_dim=input_dim,
+            center_variance=center_variance,
+            log_variance=log_variance,
+            center_offset=center_offset,
+            random_state=task_seed
+        )
+        
+        # Project to lower dimension
+        data_list = project_data_list(data_list, d=proj_dim)
+        input_data = input_data_class(n_classes, data_list)
+        
+        # Generate l0 values
+        l0 = np.ones(n_nodes)
+        
+        # Randomize internal nodes only (indices NR to NR + hidden_dim)
+        internal_start = NR
+        internal_end = NR + hidden_dim
+        n_internal = internal_end - internal_start
+        
+        # Log-normal distribution for l0 at internal nodes
+        if n_internal > 0:
+            log_l0_internal = np.random.randn(n_internal) * l0_log_std + l0_log_mean
+            l0[internal_start:internal_end] = np.exp(log_l0_internal)
+        
+        # Store task
+        task_id = f"task_{task_idx}"
+        tasks[task_id] = {
+            'input_data': input_data,
+            'l0': l0,
+            'n_classes': n_classes,
+            'log_means': log_means,
+            'seed': task_seed,
+        }
+    
+    return MultiTaskInputData(tasks)
+
+
+def run_training_crn_multitask(
+    trainer: UnifiedTrainer,
+    multi_task_data: MultiTaskInputData,
+    n_classes: int,
+    num_batches: int,
+    batch_size: int,
+    T_start: float = 1.0,
+    T_end: float = 0.2,
+    T_decay: float = 0.99,
+    noise_start: float = 5.0,
+    noise_end: float = 0.0,
+    noise_decay: float = 0.99,
+    print_every: int = 50,
+    history: 'TrainingHistory' = None,
+    verbose: bool = True
+) -> 'TrainingHistory':
+    """
+    Run training loop for CRN models with multiple tasks.
+    
+    Each task has its own data distribution and l0 values.
+    The model learns shared rates across all tasks.
+    
+    Args:
+        trainer: UnifiedTrainer instance (should have frozen_params=['log_l0'])
+        multi_task_data: MultiTaskInputData with task-specific data and l0
+        n_classes: number of classes (assumed same for all tasks)
+        num_batches: number of batches to train
+        batch_size: samples per batch
+        T_start: initial softmax temperature
+        T_end: final softmax temperature
+        T_decay: temperature decay rate per batch
+        noise_start: initial gradient noise scale
+        noise_end: final gradient noise scale
+        noise_decay: noise decay rate per batch
+        print_every: print diagnostics every N batches
+        history: TrainingHistory instance (created if None)
+        verbose: whether to print progress
+        
+    Returns:
+        TrainingHistory with recorded metrics
+    """
+    import time
+    import random
+    
+    if history is None:
+        history = TrainingHistory(n_classes)
+    
+    start_time = time.time()
+    
+    if verbose:
+        model_type = "CRN"
+        if hasattr(trainer.model, 'forward_method'):
+            model_type = f"CRN ({trainer.model.forward_method})"
+        print(f"Starting {model_type} multi-task training: {num_batches} batches, "
+              f"batch_size={batch_size}, n_tasks={multi_task_data.n_tasks}")
+        print("=" * 80)
+    
+    for batch in range(num_batches):
+        # Annealing schedules
+        temperature = max(T_end, T_start * (T_decay ** batch))
+        noise_scale = max(noise_end, noise_start * (noise_decay ** batch))
+        
+        batch_loss = 0.0
+        batch_correct = 0
+        batch_valid = 0
+        batch_grad_norms = None
+        
+        for sample in range(batch_size):
+            # Sample a task
+            task_id = multi_task_data.sample_task()
+            
+            # Set l0 for this task (context switch)
+            trainer.model._default_l0 = multi_task_data.get_l0(task_id).copy()
+            
+            # Sample class and get input from this task
+            target_idx = random.randrange(n_classes)
+            inputs = multi_task_data.get_next_training_sample(task_id, target_idx)
+            
+            try:
+                loss, probs, grad_norms = trainer.train_step(
+                    inputs=inputs,
+                    target_idx=target_idx,
+                    temperature=temperature,
+                    noise_scale=noise_scale
+                )
+                
+                # Check for numerical issues
+                if np.any(np.isnan(probs)) or np.any(np.isinf(probs)):
+                    if verbose:
+                        print(f"  Warning: Invalid probs at batch {batch}, sample {sample}")
+                    continue
+                
+                # Check for invalid gradients
+                has_invalid_grad = any(
+                    np.any(np.isnan(g)) or np.any(np.isinf(g)) 
+                    for g in grad_norms.values()
+                )
+                if has_invalid_grad:
+                    if verbose:
+                        print(f"  Warning: Invalid gradient at batch {batch}, sample {sample}")
+                    continue
+                
+                batch_loss += loss
+                history.record_sample_loss(target_idx, loss)
+                batch_correct += int(trainer.compute_accuracy(probs, target_idx))
+                batch_valid += 1
+                batch_grad_norms = grad_norms
+                
+            except Exception as e:
+                if verbose:
+                    print(f"  Warning: Training step failed at batch {batch}, sample {sample}: {e}")
+                continue
+        
+        # Skip if no valid samples
+        if batch_valid == 0:
+            if verbose:
+                print(f"  Batch {batch}: No valid samples, skipping")
+            continue
+        
+        # Get param stats (for CRN, show rate range)
+        params = trainer.model.get_params()
+        if 'log_rates' in params:
+            rates = np.exp(params['log_rates'])
+            param_stats = (rates.min(), rates.max(), rates.mean())
+        else:
+            param_values = np.concatenate([p.flatten() for p in params.values()])
+            param_stats = (param_values.min(), param_values.max(), param_values.mean())
+        
+        # Record batch metrics
+        history.record_batch(
+            avg_loss=batch_loss / batch_valid,
+            accuracy=batch_correct / batch_valid,
+            grad_norms=batch_grad_norms if batch_grad_norms else {},
+            temperature=temperature,
+            noise_scale=noise_scale,
+            param_stats=param_stats
+        )
+        
+        # Print diagnostics
+        if verbose and (batch % print_every == 0 or batch == num_batches - 1):
+            recent_loss = history.get_recent_avg('loss')
+            recent_acc = history.get_recent_avg('accuracy')
+            
+            grad_str = ""
+            if batch_grad_norms:
+                grad_str = " ".join([f"{k[:6]}:{v:.2e}" for k, v in batch_grad_norms.items()])
+            
+            pmin, pmax, _ = param_stats
+            print(f"Batch {batch:4d}/{num_batches} | "
+                  f"Loss: {batch_loss/batch_valid:.4f} (avg: {recent_loss:.4f}) | "
+                  f"Acc: {batch_correct/batch_valid:.1%} (avg: {recent_acc:.1%}) | "
+                  f"{grad_str} | "
+                  f"Rates: [{pmin:.2e}, {pmax:.2e}]")
+    
+    training_time = time.time() - start_time
+    
+    if verbose:
+        print("=" * 80)
+        history.print_summary(training_time)
+    
+    return history
 
 
 # class GraphComputationJIT:
