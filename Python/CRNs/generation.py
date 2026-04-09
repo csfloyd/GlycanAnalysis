@@ -8,6 +8,7 @@ linkage groups, and other network structures.
 import numpy as np
 import networkx as nx
 from typing import List, Dict, Tuple, Iterator
+import re
 import sympy
 from scipy.optimize import nnls
 from scipy.optimize import minimize
@@ -841,6 +842,263 @@ def expand_catalyzed_reactions(species_names, reaction_strings, L):
     
     return new_species_names, new_reaction_strings, new_L
 
+
+def expand_to_MP(species_names, reaction_strings, L, num_P=2):
+    """
+    Expand S-style species into multisite phosphorylation phosphoforms.
+
+    The function identifies species named like:
+      - S1, S2, ...      (0 phosphates)
+      - S1s, S2s, ...    (1 phosphate)
+
+    and extends each detected substrate family to include phosphoforms up to
+    `num_P`, e.g. S1ss, S1sss when needed. It also adds all pairwise
+    dephosphorylation-direction reactions (higher s-count to lower s-count),
+    such as:
+      - S1ss -> S1s
+      - S1ss -> S1
+      - S1sss -> S1ss
+      - S1sss -> S1s
+      - S1sss -> S1
+
+    Reverse reactions are intentionally not added here.
+
+    Strict conservation-law behavior:
+    For each substrate family (e.g. S1), exactly one row in L must contain
+    nonzero contribution from S1 and/or S1s. New phosphoforms are assigned to
+    that same row with coefficient 1. A ValueError is raised if zero or
+    multiple rows match.
+
+    Args:
+        species_names: List of species names.
+        reaction_strings: List of reaction strings.
+        L: Conservation-law matrix (n_cons x n_species).
+        num_P: Maximum phosphorylation level (number of trailing 's').
+
+    Returns:
+        tuple: (new_species_names, new_reaction_strings, new_L)
+    """
+    if num_P < 1:
+        raise ValueError("num_P must be >= 1")
+
+    new_species_names = species_names.copy()
+    new_reaction_strings = reaction_strings.copy()
+    new_L = L.copy()
+
+    pattern = re.compile(r"^(S\d+)(s*)$")
+
+    # Track S-family bases present in the scheme.
+    bases = []
+    for sp in species_names:
+        match = pattern.match(sp)
+        if match is not None:
+            base = match.group(1)
+            if base not in bases:
+                bases.append(base)
+
+    # Add missing phosphoforms while enforcing strict L-row assignment.
+    for base in bases:
+        idx_base = species_names.index(base) if base in species_names else None
+        idx_s1 = species_names.index(f"{base}s") if f"{base}s" in species_names else None
+
+        if idx_base is None and idx_s1 is None:
+            # Should not happen if base came from species_names, but keep explicit.
+            raise ValueError(f"Cannot locate base species for family {base}")
+
+        if idx_base is not None and idx_s1 is not None:
+            row_mask = (new_L[:, idx_base] != 0) | (new_L[:, idx_s1] != 0)
+        elif idx_base is not None:
+            row_mask = new_L[:, idx_base] != 0
+        else:
+            row_mask = new_L[:, idx_s1] != 0
+
+        matching_rows = np.where(row_mask)[0]
+        if len(matching_rows) != 1:
+            raise ValueError(
+                f"Expected exactly one conservation row for {base}, found {len(matching_rows)}"
+            )
+        target_row = matching_rows[0]
+
+        # Ensure family has forms S, Ss, ... up to num_P.
+        for level in range(num_P + 1):
+            form = f"{base}{'s' * level}"
+            if form in new_species_names:
+                continue
+            new_species_names.append(form)
+            new_col = np.zeros((new_L.shape[0], 1), dtype=new_L.dtype)
+            new_col[target_row, 0] = 1
+            new_L = np.column_stack([new_L, new_col])
+
+    # Add all downward pairwise links between phosphoforms in each family.
+    existing_reactions = set(new_reaction_strings)
+    for base in bases:
+        forms = [f"{base}{'s' * level}" for level in range(num_P + 1)]
+        for hi in range(num_P, 0, -1):
+            for lo in range(hi - 1, -1, -1):
+                reac = f"{forms[hi]} -> {forms[lo]}"
+                if reac not in existing_reactions:
+                    new_reaction_strings.append(reac)
+                    existing_reactions.add(reac)
+
+    return new_species_names, new_reaction_strings, new_L
+
+
+def expand_MP_catalysis(species_names, reaction_strings, L):
+    """
+    Expand two-body catalytic dephosphorylation reactions across MP phosphoforms.
+
+    Template reactions detected:
+        C + Xs -> C + X
+    where C is unchanged (catalyst) and X is an S-family substrate (e.g. S1).
+
+    For each detected template, this adds reactions:
+        C + Xss -> C + Xs
+        C + Xsss -> C + Xss
+        ...
+    up to the highest phosphoform already present in species_names for X.
+
+    This function does not create new species or change L. It expects MP
+    phosphoforms to already exist (for example via expand_to_MP).
+
+    Args:
+        species_names: List of species names.
+        reaction_strings: List of reaction strings.
+        L: Conservation-law matrix (passed through unchanged).
+
+    Returns:
+        tuple: (new_species_names, new_reaction_strings, new_L)
+    """
+    phospho_pattern = re.compile(r"^(S\d+)(s*)$")
+
+    # Build max phospho-level per S-family and ensure at least one ss exists.
+    max_level_by_base = {}
+    has_ss_or_higher = False
+    for sp in species_names:
+        match = phospho_pattern.match(sp)
+        if match is None:
+            continue
+        base = match.group(1)
+        level = len(match.group(2))
+        if level >= 2:
+            has_ss_or_higher = True
+        if base not in max_level_by_base or level > max_level_by_base[base]:
+            max_level_by_base[base] = level
+
+    if not has_ss_or_higher:
+        raise ValueError("No 'ss' (or higher) phosphoforms found; nothing to expand.")
+
+    def parse_side(side):
+        parts = [p.strip() for p in side.split("+")]
+        if len(parts) != 2:
+            return None
+        return parts
+
+    def parse_phospho(spec):
+        match = phospho_pattern.match(spec)
+        if match is None:
+            return None
+        return match.group(1), len(match.group(2))
+
+    new_species_names = species_names.copy()
+    new_reaction_strings = reaction_strings.copy()
+    existing_reactions = set(new_reaction_strings)
+
+    for reaction in reaction_strings:
+        if "->" not in reaction:
+            continue
+
+        left_raw, right_raw = reaction.split("->", 1)
+        left = parse_side(left_raw.strip())
+        right = parse_side(right_raw.strip())
+        if left is None or right is None:
+            continue
+
+        # Catalyst is the unique species unchanged across both sides.
+        common = set(left) & set(right)
+        if len(common) != 1:
+            continue
+        catalyst = next(iter(common))
+
+        left_other = left[0] if left[1] == catalyst else left[1]
+        right_other = right[0] if right[1] == catalyst else right[1]
+
+        left_info = parse_phospho(left_other)
+        right_info = parse_phospho(right_other)
+        if left_info is None or right_info is None:
+            continue
+
+        left_base, left_level = left_info
+        right_base, right_level = right_info
+
+        # Require one-step downward template (Xs -> X, Xss -> Xs, ...).
+        if left_base != right_base or left_level != right_level + 1:
+            continue
+
+        max_level = max_level_by_base.get(left_base, left_level)
+        if max_level < left_level + 1:
+            continue
+
+        # Add C+X{k} -> C+X{k-1} for levels above the template level.
+        for level in range(left_level + 1, max_level + 1):
+            src = f"{left_base}{'s' * level}"
+            dst = f"{left_base}{'s' * (level - 1)}"
+            new_reaction = f"{catalyst}+{src} -> {catalyst}+{dst}"
+            if new_reaction not in existing_reactions:
+                new_reaction_strings.append(new_reaction)
+                existing_reactions.add(new_reaction)
+
+    return new_species_names, new_reaction_strings, L
+
+
+def expand_MP_self_catalysis(species_names, reaction_strings, L):
+    """
+    Add self-catalyzed MP reactions of the form:
+        Sis + Siss -> Sis + Si
+    for each S-family where Siss exists.
+
+    This function is independent of other expansion helpers and only relies on
+    the provided species/reactions. It does not create new species or alter L.
+
+    Args:
+        species_names: List of species names.
+        reaction_strings: List of reaction strings.
+        L: Conservation-law matrix (passed through unchanged).
+
+    Returns:
+        tuple: (new_species_names, new_reaction_strings, new_L)
+    """
+    phospho_pattern = re.compile(r"^(S\d+)(s*)$")
+
+    families_with_ss = set()
+    species_set = set(species_names)
+    for sp in species_names:
+        match = phospho_pattern.match(sp)
+        if match is None:
+            continue
+        base = match.group(1)
+        level = len(match.group(2))
+        if level >= 2:
+            families_with_ss.add(base)
+
+    if len(families_with_ss) == 0:
+        raise ValueError("No 'ss' phosphoforms found; nothing to add.")
+
+    new_species_names = species_names.copy()
+    new_reaction_strings = reaction_strings.copy()
+    existing_reactions = set(new_reaction_strings)
+
+    for base in sorted(families_with_ss, key=lambda x: int(x[1:])):
+        s1 = f"{base}s"
+        s2 = f"{base}ss"
+        s0 = base
+        if s1 in species_set and s2 in species_set and s0 in species_set:
+            reaction = f"{s1}+{s2} -> {s1}+{s0}"
+            if reaction not in existing_reactions:
+                new_reaction_strings.append(reaction)
+                existing_reactions.add(reaction)
+
+    return new_species_names, new_reaction_strings, L
+
 def get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS):
     # Create a directed graph
     G = nx.DiGraph()
@@ -872,7 +1130,7 @@ def count_simple_paths(G, source, target):
     except nx.NetworkXNoPath:
         return 0
 
-def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR, NS, num_outs = 1,node_size=600, arrow_size=25, font_size=12, ax=None):
+def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR, NS, node_size=600, arrow_size=25, rad=0.4, num_outputs=1, font_size=12, ax=None, flip_horizontal=False):
     """
     Visualize the DAG signaling network including receptor connections.
     
@@ -882,6 +1140,7 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
         NR: Number of receptors
         NS: Number of substrates
         ax: Optional matplotlib axis to plot into. If None, creates a new figure and axis.
+        flip_horizontal: If True, flip node positions over the vertical axis (y-axis) through the origin.
 
         title: Title for the plot
         
@@ -923,6 +1182,25 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
         #pos = nx.spring_layout(G, k=2, iterations=50)
         pos = nx.circular_layout(G)
     
+    # Center the positions at the origin
+    pos_array = np.array(list(pos.values()))
+    center = pos_array.mean(axis=0)
+    for node in pos:
+        pos[node] = pos[node] - center
+
+    # Flip horizontally (mirror over vertical axis) if requested
+    if flip_horizontal:
+        for node in pos:
+            pos[node][0] = -pos[node][0]
+
+    # Set symmetric axis limits with padding
+    pos_array = np.array(list(pos.values()))
+    max_extent = np.abs(pos_array).max() * 1.15  # 15% padding
+    ax.set_xlim(-max_extent, max_extent)
+    ax.set_ylim(-max_extent, max_extent)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    
     # Draw nodes
     receptor_nodes = [node for node in G.nodes() if node.startswith('R')]
     substrate_nodes = [node for node in G.nodes() if node.startswith('S')]
@@ -930,10 +1208,10 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
     nx.draw_networkx_nodes(G, pos, nodelist=receptor_nodes, 
                           node_color='lightblue', node_size=node_size, 
                           node_shape='s', ax=ax, label='Receptors')
-    nx.draw_networkx_nodes(G, pos, nodelist=substrate_nodes[:-num_outs], 
+    nx.draw_networkx_nodes(G, pos, nodelist=substrate_nodes[:-1], 
                           node_color='pink', node_size=node_size, 
                           node_shape='o', ax=ax, label='Substrates')
-    nx.draw_networkx_nodes(G, pos, nodelist=substrate_nodes[-num_outs:], 
+    nx.draw_networkx_nodes(G, pos, nodelist=substrate_nodes[-num_outputs:], 
                           node_color='lightgreen', node_size=node_size, 
                           node_shape='o', ax=ax, label='Substrates')
     
@@ -941,13 +1219,16 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
     receptor_edges = [(u, v) for u, v, d in G.edges(data=True) if d['edge_type'] == 'receptor']
     substrate_edges = [(u, v) for u, v, d in G.edges(data=True) if d['edge_type'] == 'substrate']
     
-    nx.draw_networkx_edges(G, pos, edgelist=receptor_edges, 
-                          edge_color='blue', arrows=True, arrowsize=arrow_size, 
-                          ax=ax, label='Receptor activation', connectionstyle="arc3,rad=-0.4")
-    nx.draw_networkx_edges(G, pos, edgelist=substrate_edges, 
-                          edge_color='red', arrows=True, arrowsize=arrow_size, 
-                          ax=ax, label='Substrate catalysis', connectionstyle="arc3,rad=0.4")
-    
+    nx.draw_networkx_edges(
+        G, pos, edgelist=receptor_edges, 
+        edge_color='blue', arrows=True, arrowsize=arrow_size, 
+        ax=ax, label='Receptor activation', connectionstyle=f"arc3,rad={-rad}"
+    )
+    nx.draw_networkx_edges(
+        G, pos, edgelist=substrate_edges, 
+        edge_color='red', arrows=True, arrowsize=arrow_size, 
+        ax=ax, label='Substrate catalysis', connectionstyle=f"arc3,rad={rad}"
+    )
     # Draw labels
     nx.draw_networkx_labels(G, pos, ax=ax, font_size=font_size, font_family='Arial')
     
@@ -956,6 +1237,7 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
         return fig
     else:
         return ax
+
 
 def generate_random_dimerization_network(NS, prob, include_reverse=False):
     """

@@ -1553,7 +1553,8 @@ def generate_multitask_data(
     input_data_class,
     l0_log_mean: float = 0.0,
     l0_log_std: float = 1.0,
-    base_seed: int = None
+    base_seed: int = None,
+    permute_labels_only: bool = False
 ) -> MultiTaskInputData:
     """
     Generate multi-task data with random l0 values for internal nodes.
@@ -1574,6 +1575,9 @@ def generate_multitask_data(
         l0_log_mean: mean of log(l0) for internal nodes
         l0_log_std: std of log(l0) for internal nodes
         base_seed: random seed for reproducibility
+        permute_labels_only: if True, use same data clouds for all tasks but
+            randomly permute class labels. This creates truly conflicting tasks
+            that require different l0 to solve.
         
     Returns:
         MultiTaskInputData container
@@ -1581,6 +1585,24 @@ def generate_multitask_data(
     import random as random_module
     
     tasks = {}
+    
+    # If permute_labels_only, generate data once and reuse with permuted labels
+    if permute_labels_only:
+        # Generate data clouds once using base_seed
+        data_seed = base_seed if base_seed is not None else 42
+        np.random.seed(data_seed)
+        random_module.seed(data_seed)
+        
+        _, base_data_list, base_log_means = generate_lognormal_mixture_random_centers(
+            n_classes=n_classes,
+            n_samples_per_class=n_samples_per_class,
+            input_dim=input_dim,
+            center_variance=center_variance,
+            log_variance=log_variance,
+            center_offset=center_offset,
+            random_state=data_seed
+        )
+        base_data_list = project_data_list(base_data_list, d=proj_dim)
     
     for task_idx in range(n_tasks):
         # Set seed for this task if base_seed provided
@@ -1590,20 +1612,35 @@ def generate_multitask_data(
             np.random.seed(task_seed)
             random_module.seed(task_seed)
         
-        # Generate data clouds for this task
-        _, data_list, log_means = generate_lognormal_mixture_random_centers(
-            n_classes=n_classes,
-            n_samples_per_class=n_samples_per_class,
-            input_dim=input_dim,
-            center_variance=center_variance,
-            log_variance=log_variance,
-            center_offset=center_offset,
-            random_state=task_seed
-        )
-        
-        # Project to lower dimension
-        data_list = project_data_list(data_list, d=proj_dim)
-        input_data = input_data_class(n_classes, data_list)
+        if permute_labels_only:
+            # Use same data but with permuted labels
+            # Generate a random permutation for this task
+            permutation = list(range(n_classes))
+            random_module.shuffle(permutation)
+            
+            # Reorder data_list according to permutation
+            # permutation[new_label] = old_label means class new_label gets data from old_label
+            permuted_data_list = [base_data_list[permutation[i]] for i in range(n_classes)]
+            permuted_log_means = [base_log_means[permutation[i]] for i in range(n_classes)]
+            
+            input_data = input_data_class(n_classes, permuted_data_list)
+            log_means = permuted_log_means
+        else:
+            # Generate fresh data clouds for this task
+            _, data_list, log_means = generate_lognormal_mixture_random_centers(
+                n_classes=n_classes,
+                n_samples_per_class=n_samples_per_class,
+                input_dim=input_dim,
+                center_variance=center_variance,
+                log_variance=log_variance,
+                center_offset=center_offset,
+                random_state=task_seed
+            )
+            
+            # Project to lower dimension
+            data_list = project_data_list(data_list, d=proj_dim)
+            input_data = input_data_class(n_classes, data_list)
+            permutation = None
         
         # Generate l0 values
         l0 = np.ones(n_nodes)
@@ -1626,6 +1663,7 @@ def generate_multitask_data(
             'n_classes': n_classes,
             'log_means': log_means,
             'seed': task_seed,
+            'permutation': permutation,  # Store permutation for debugging
         }
     
     return MultiTaskInputData(tasks)
@@ -1645,7 +1683,8 @@ def run_training_crn_multitask(
     noise_decay: float = 0.99,
     print_every: int = 50,
     history: 'TrainingHistory' = None,
-    verbose: bool = True
+    verbose: bool = True,
+    debug_l0: bool = False
 ) -> 'TrainingHistory':
     """
     Run training loop for CRN models with multiple tasks.
@@ -1668,6 +1707,7 @@ def run_training_crn_multitask(
         print_every: print diagnostics every N batches
         history: TrainingHistory instance (created if None)
         verbose: whether to print progress
+        debug_l0: if True, print l0 values for first few samples to verify task switching
         
     Returns:
         TrainingHistory with recorded metrics
@@ -1704,6 +1744,13 @@ def run_training_crn_multitask(
             
             # Set l0 for this task (context switch)
             trainer.model._default_l0 = multi_task_data.get_l0(task_id).copy()
+            
+            # Debug: verify l0 is being set correctly
+            if debug_l0 and batch == 0 and sample < 5:
+                n_inputs = trainer.model.n_inputs
+                n_classes_model = trainer.model.n_classes
+                internal_l0 = trainer.model._default_l0[n_inputs:-n_classes_model] if n_classes_model > 0 else trainer.model._default_l0[n_inputs:]
+                print(f"  DEBUG: {task_id}, sample {sample}: internal l0 = {internal_l0[:4]}...")  # First 4 values
             
             # Sample class and get input from this task
             target_idx = random.randrange(n_classes)

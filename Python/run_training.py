@@ -14,7 +14,7 @@ parser = argparse.ArgumentParser(description="SLURM job script with arguments.")
 arg1_type = int
 # Define command-line arguments
 parser.add_argument("--param1", type=int, required=True, help="An integer parameter")
-parser.add_argument("--param2", type=int, required=False, help="An integer parameter")
+parser.add_argument("--param2", type=float, required=False, help="An integer parameter")
 parser.add_argument("--param3", type=int, required=False, help="An integer parameter")
 parser.add_argument("--output", type=str, required=True, help="A string parameter")
 
@@ -27,14 +27,14 @@ output_dir = args.output
 seed = args.param3
 n_classes = 5
 input_dim = 10
-center_variance = 20.0
+center_variance = 10.0
 log_variance = 1
 proj_dim = args.param1
 NR = proj_dim
-hidden_dim = args.param2
+hidden_dim = 5 #args.param2
 
 
-num_batches=5000
+num_batches=1000
 batch_size=25
 T_start=0.1
 T_end=0.1
@@ -76,9 +76,14 @@ NS_vec = [hidden_dim,n_classes]
 NS = sum(NS_vec)
 input_nodes = [f'R{i}' for i in range(NR)]
 target_nodes = [f'S{NS - n_classes + i}' for i in range(n_classes)]
-p_r = 0.0
 
-species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, include_reverse=False, include_uncatalyzed=True)
+p_r = 0.0
+p_f = args.param2
+species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, p_f = p_f, include_reverse=False, include_uncatalyzed=True)
+
+### add recurrences -comment out if not using
+# reaction_strings, adjacency_matrix = add_recurrent_connections(adjacency_matrix, reaction_strings, False, input_substrates_list, NR, NS, 1.0, seed=seed)
+
 target_node_idxs = [species_names.index(node) for node in target_nodes]
 
 G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
@@ -114,13 +119,18 @@ rates = np.exp(np.random.randn(n_rates) * 1.0)
 r_n.update_rates(rates)
 
 # ============== GRAPH COMPUTATION ==============
-graph_comp = GraphComputation(G, input_nodes, target_nodes)
-graph_comp.build_r_n_maps(r_n)
+use_graph_forward = True  # Set False to use ODE integration instead
+if use_graph_forward:
+    graph_comp = GraphComputation(G, input_nodes, target_nodes)
+    graph_comp.build_r_n_maps(r_n)
+    n_nodes = len(graph_comp.nodes)
+    forward_method = 'graph'
+else:
+    n_nodes = len(L)
+    graph_comp = None
+    forward_method = 'ode'
 
-# Build l0 to match graph node ordering
-n_nodes = len(graph_comp.nodes)
 default_l0 = np.ones(n_nodes)
-
 # Target node indices in species list
 target_node_idxs = [r_n.species_names.index(node) for node in target_nodes]
 n_inputs = len(input_nodes)
@@ -133,7 +143,7 @@ crn_model = CRNModel(
     class_ids=target_node_idxs,
     n_inputs=n_inputs,
     default_l0=default_l0,
-    forward_method='graph',
+    forward_method=forward_method,
     graph_comp=graph_comp,
     dR_dC_func=dR_dC_func,
     dR_dk_func=dR_dk_func,
@@ -145,8 +155,9 @@ crn_model = CRNModel(
 trainer = UnifiedTrainer(
     crn_model,
     optimizer_type='adam',
-    lr_dict={'log_rates': 0.001, 'log_l0': 0.001},
-    max_grad_norm=50.0
+    lr_dict={'log_rates': 0.005, 'log_l0': 0.005},
+    max_grad_norm=50.0,
+    frozen_params=['log_l0']
 )
 
 # ============== TRAIN ==============

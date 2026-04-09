@@ -14,7 +14,7 @@ parser = argparse.ArgumentParser(description="SLURM job script with arguments.")
 arg1_type = int
 # Define command-line arguments
 parser.add_argument("--param1", type=int, required=True, help="An integer parameter")
-parser.add_argument("--param2", type=int, required=False, help="An integer parameter")
+parser.add_argument("--param2", type=float, required=False, help="An integer parameter")
 parser.add_argument("--param3", type=int, required=False, help="An integer parameter")
 parser.add_argument("--output", type=str, required=True, help="A string parameter")
 
@@ -29,10 +29,10 @@ n_classes = 5
 input_dim = 10
 center_variance = 20.0
 log_variance = 1
-proj_dim = args.param1
+proj_dim = 5
 NR = proj_dim
-hidden_dim = args.param2
-n_tasks = 5  # Number of tasks for multi-task learning
+hidden_dim = 5 #args.param2
+n_tasks = args.param1  # Number of tasks for multi-task learning
 
 
 num_batches=5000
@@ -47,7 +47,7 @@ print_every=250
 
 # Multi-task l0 parameters
 l0_log_mean = 0.0
-l0_log_std = 1.0
+l0_log_std = 3.0
 
 np.random.seed(seed)
 random.seed(seed)
@@ -62,9 +62,10 @@ NS_vec = [hidden_dim,n_classes]
 NS = sum(NS_vec)
 input_nodes = [f'R{i}' for i in range(NR)]
 target_nodes = [f'S{NS - n_classes + i}' for i in range(n_classes)]
-p_r = 0.0
 
-species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, include_reverse=False, include_uncatalyzed=True)
+p_r = 0.0
+p_f = args.param2
+species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, p_f = p_f, include_reverse=False, include_uncatalyzed=True)
 target_node_idxs = [species_names.index(node) for node in target_nodes]
 
 G = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
@@ -126,7 +127,8 @@ multi_task_data = generate_multitask_data(
     input_data_class=InputData,
     l0_log_mean=l0_log_mean,
     l0_log_std=l0_log_std,
-    base_seed=seed
+    base_seed=seed,
+    permute_labels_only=True
 )
 
 # Use first task's l0 as initial default (will be overwritten during training)

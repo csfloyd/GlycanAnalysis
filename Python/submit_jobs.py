@@ -3,7 +3,7 @@ import shutil
 import numpy as np
 
 n_params = 2
-output_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/dag_n_paths_idx_NS4_biggest_pr1/"
+output_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/dag_n_paths_idx_NS4_biggest_pr0/"
 
 # Define the range of values for param1 and labels for param2
 param1_values = [6, 7, 8, 9, 10, 11, 12]

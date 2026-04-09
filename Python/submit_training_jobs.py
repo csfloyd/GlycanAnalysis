@@ -3,13 +3,14 @@ import shutil
 import numpy as np
 
 n_params = 3
-output_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/Training/NR_width_seed/"
+output_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/Training/NR_width_seed_big_pr1/"
+#output_base = "/project/svaikunt/csfloyd/TrainingCRNs/Dirs/Training/tasks_width_seed_big/"
 
 # Define the range of values for param1 and labels for param2
 
-param1_values = [1,2,3]
-param2_values = [1,2,3]
-param3_values = [1,2,3]
+param1_values = [1,2,3,4,5]
+param2_values = [1,2,3,4,5]
+param3_values = [1,2,3,4,5]
 
 
 

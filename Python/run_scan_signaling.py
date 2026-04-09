@@ -65,7 +65,7 @@ else:
     n_paths = args.param1
     sample_idx = args.param2
     ## set p_r below
-    adjacency_matrix = networks[n_paths][sample_idx]['adjacency_matrix_1']
+    adjacency_matrix = networks[n_paths][sample_idx]['adjacency_matrix_0']
     input_substrates_list = networks[n_paths][sample_idx]['input_substrates_list']
 
     species_names, reaction_strings, L = generate_specified_dag_signaling_network(adjacency_matrix, input_substrates_list, include_reverse=False, include_uncatalyzed=True)
