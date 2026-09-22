@@ -431,82 +431,182 @@ def plot_mlp_fits(x_data, y_data, results, max_show=9):
     plt.show()
 
 
-def count_critical_points(network_data, target_node_idx=None, l0_list=None, fd_comparison = False, threshold=0.2, pad=4, eps = 1e-8):
+# def count_critical_points(network_data, target_node_idx=None, l0_list=None, fd_comparison = False, threshold=0.2, pad=4, eps = 1e-8):
+#     """
+#     Count critical points (sign changes) in derivatives for a given network.
+#
+#     Parameters:
+#     network_data: Dictionary containing network data with keys:
+#                   - 'dC_dl_list': List of derivatives dC/dl0
+#                   - 'C_full_list': List of concentration values
+#                   - 'l0_list': List of l0 values (optional, can be provided separately)
+#                   - 'network_params': Network parameters including 'species_names' and 'NS'
+#     target_node_idx: Index of target node to analyze (default: last species, NS-1)
+#     l0_list: Optional list of l0 values (overrides network_data['l0_list'])
+#     threshold: Threshold for finite difference consistency check
+#     pad: Number of points to skip at beginning and end for consistency check
+#     eps: Threshold for small derivatives
+#     Returns:
+#     int: Number of sign changes (critical points) if consistent, None if inconsistent
+#     """
+#     try:
+#         # Extract data from network_data
+#         d_C_d_l0_list = network_data['dC_dl_list']
+#         C_full_list = network_data['C_full_list']
+#
+#         # Get l0_list from provided argument or network_data
+#         if l0_list is None:
+#             l0_list = network_data.get('l0_list')
+#             if l0_list is None:
+#                 raise ValueError("l0_list must be provided either as argument or in network_data")
+#
+#         # Determine target node index
+#         if target_node_idx is None:
+#             # Default to last species
+#             NS = network_data['network_params']['NS']
+#             target_node_idx = NS - 1
+#
+#         # Extract derivative values for target node
+#         # Assuming d_C_d_l0_list contains derivatives for all species
+#         # If it's already a 1D list, use it directly; otherwise extract target species
+#         if isinstance(d_C_d_l0_list[0], (list, np.ndarray)) and len(np.shape(d_C_d_l0_list[0])) > 0:
+#             # Multi-dimensional: extract target node
+#             d_vals = [d_C_d_l0_list[i][target_node_idx] if isinstance(d_C_d_l0_list[i][target_node_idx], (int, float, np.number))
+#                      else d_C_d_l0_list[i][target_node_idx][0]
+#                      for i in range(len(d_C_d_l0_list))]
+#         else:
+#             # Already 1D
+#             d_vals = d_C_d_l0_list
+#
+#         # Extract concentration values for target node
+#         if isinstance(C_full_list[0], (list, np.ndarray)) and len(np.shape(C_full_list[0])) > 0:
+#             C_vals = [C_full_list[i][target_node_idx] if isinstance(C_full_list[i][target_node_idx], (int, float, np.number))
+#                      else C_full_list[i][target_node_idx][0]
+#                      for i in range(len(C_full_list))]
+#         else:
+#             C_vals = C_full_list
+#
+#         # Create log scale x-axis (1D scanned l0, or full vectors using dim 0)
+#         l0_arr = np.asarray(l0_list, dtype=float)
+#         if l0_arr.ndim == 1:
+#             log_l0_x = np.log10(l0_arr)
+#         else:
+#             log_l0_x = np.log10(l0_arr[:, 0])
+#
+#         # Calculate finite differences for consistency check
+#         if fd_comparison:
+#             d_vals_fd = calculate_finite_differences(C_vals, log_l0_x, log_y=False, log_x=True)
+#             if not check_list_consistency(d_vals_fd, d_vals, threshold=threshold, pad=pad):
+#                 print("Inconsistent derivatives found")
+#                 return None, None  # Inconsistent derivatives
+#
+#         max_log_deriv = np.max(np.abs(d_vals * np.array(log_l0_x)))
+#
+#         # Find sign changes
+#         sign_change_indices = []
+#         for i in range(len(d_vals) - 1):
+#             if (d_vals[i] * d_vals[i+1] < 0) and (np.abs(d_vals[i] - d_vals[i+1]) > eps):  # Sign change occurs
+#                 sign_change_indices.append(i)
+#
+#         return (len(sign_change_indices), max_log_deriv)
+#
+#     except Exception as e:
+#         print(f"Error in count_critical_points: {e}")
+#         return None, None
+
+
+def _extract_target_series(values, target_node_idx):
+    """Return a 1D float series. Sampling stores 1D; older data may be per-point vectors/matrices."""
+    if isinstance(values[0], (list, np.ndarray)) and len(np.shape(values[0])) > 0:
+        series = []
+        for item in values:
+            v = item[target_node_idx]
+            series.append(v if isinstance(v, (int, float, np.number)) else v[0])
+        return np.asarray(series, dtype=float)
+    return np.asarray(values, dtype=float)
+
+
+def count_critical_points(network_data, target_node_idx=None, l0_list=None, fd_comparison=False,
+                          threshold=0.2, pad=4, eps=1e-3, min_delta_c=0.0, rel_delta_c=0.01):
     """
-    Count critical points (sign changes) in derivatives for a given network.
-    
-    Parameters:
-    network_data: Dictionary containing network data with keys:
-                  - 'dC_dl_list': List of derivatives dC/dl0
-                  - 'C_full_list': List of concentration values
-                  - 'l0_list': List of l0 values (optional, can be provided separately)
-                  - 'network_params': Network parameters including 'species_names' and 'NS'
-    target_node_idx: Index of target node to analyze (default: last species, NS-1)
-    l0_list: Optional list of l0 values (overrides network_data['l0_list'])
-    threshold: Threshold for finite difference consistency check
-    pad: Number of points to skip at beginning and end for consistency check
-    eps: Threshold for small derivatives
+    Count critical points as sign changes of dC / dlog10(l0).
+
+    Stored sensitivities are dC/dl (linear ligand). They are converted with
+        dC/dlog10(l) = (dC/dl) * l * ln(10)
+    then a deadband |dC/dlog10(l)| < eps is treated as zero so numerical chatter
+    around a flat response is not counted. Each exit from +eps to -eps (or vice
+    versa) counts once, even if the derivative dwells near zero in between.
+    Crossings that move C by less than
+    max(min_delta_c, rel_delta_c * max(range(C), median(|C|))) are dropped.
+
     Returns:
-    int: Number of sign changes (critical points) if consistent, None if inconsistent
+        (n_critical_points, max |dC/dlog10(l)|), or (None, None) on failure.
     """
     try:
-        # Extract data from network_data
         d_C_d_l0_list = network_data['dC_dl_list']
         C_full_list = network_data['C_full_list']
-        
-        # Get l0_list from provided argument or network_data
+
         if l0_list is None:
             l0_list = network_data.get('l0_list')
             if l0_list is None:
                 raise ValueError("l0_list must be provided either as argument or in network_data")
-        
-        # Determine target node index
+
         if target_node_idx is None:
-            # Default to last species
             NS = network_data['network_params']['NS']
             target_node_idx = NS - 1
-        
-        # Extract derivative values for target node
-        # Assuming d_C_d_l0_list contains derivatives for all species
-        # If it's already a 1D list, use it directly; otherwise extract target species
-        if isinstance(d_C_d_l0_list[0], (list, np.ndarray)) and len(np.shape(d_C_d_l0_list[0])) > 0:
-            # Multi-dimensional: extract target node
-            d_vals = [d_C_d_l0_list[i][target_node_idx] if isinstance(d_C_d_l0_list[i][target_node_idx], (int, float, np.number)) 
-                     else d_C_d_l0_list[i][target_node_idx][0] 
-                     for i in range(len(d_C_d_l0_list))]
-        else:
-            # Already 1D
-            d_vals = d_C_d_l0_list
-        
-        # Extract concentration values for target node
-        if isinstance(C_full_list[0], (list, np.ndarray)) and len(np.shape(C_full_list[0])) > 0:
-            C_vals = [C_full_list[i][target_node_idx] if isinstance(C_full_list[i][target_node_idx], (int, float, np.number))
-                     else C_full_list[i][target_node_idx][0]
-                     for i in range(len(C_full_list))]
-        else:
-            C_vals = C_full_list
-            
-        # Create log scale x-axis
-        log_l0_x = [np.log10(l0[0]) if isinstance(l0, (list, np.ndarray)) else np.log10(l0) 
-                for l0 in l0_list]
-        
-        # Calculate finite differences for consistency check
-        if fd_comparison:
-            d_vals_fd = calculate_finite_differences(C_vals, log_l0_x, log_y=False, log_x=True)
-            if not check_list_consistency(d_vals_fd, d_vals, threshold=threshold, pad=pad):
-                print("Inconsistent derivatives found")
-                return None, None  # Inconsistent derivatives
-        
-        max_log_deriv = np.max(np.abs(d_vals * np.array(log_l0_x)))
 
-        # Find sign changes
-        sign_change_indices = []
-        for i in range(len(d_vals) - 1):
-            if (d_vals[i] * d_vals[i+1] < 0) and (np.abs(d_vals[i] - d_vals[i+1]) > eps):  # Sign change occurs
-                sign_change_indices.append(i)
-        
-        return (len(sign_change_indices), max_log_deriv)
-        
+        d_vals = _extract_target_series(d_C_d_l0_list, target_node_idx)
+        C_vals = _extract_target_series(C_full_list, target_node_idx)
+
+        l0_arr = np.asarray(l0_list, dtype=float)
+        if l0_arr.ndim > 1:
+            l0_arr = l0_arr[:, 0]
+
+        n = min(len(d_vals), len(C_vals), len(l0_arr))
+        d_vals, C_vals, l0_arr = d_vals[:n], C_vals[:n], l0_arr[:n]
+
+        finite = np.isfinite(d_vals) & np.isfinite(C_vals) & np.isfinite(l0_arr) & (l0_arr > 0)
+        d_vals, C_vals, l0_arr = d_vals[finite], C_vals[finite], l0_arr[finite]
+        if d_vals.size < 2:
+            return 0, 0.0
+
+        order = np.argsort(l0_arr)
+        d_vals, C_vals, l0_arr = d_vals[order], C_vals[order], l0_arr[order]
+
+        # dC/dlog10(l) has the same zeros as dC/dln(l), and matches the log10 scan axis
+        d_log = d_vals * l0_arr * np.log(10)
+        max_log_deriv = float(np.max(np.abs(d_log)))
+
+        if fd_comparison:
+            d_vals_fd = np.asarray(
+                calculate_finite_differences(C_vals, l0_arr, log_y=False, log_x=True),
+                dtype=float,
+            )
+            if not check_list_consistency(d_vals_fd, d_log, threshold=threshold, pad=pad):
+                print("Inconsistent derivatives found")
+                return None, None
+
+        c_scale = max(float(np.ptp(C_vals)), float(np.median(np.abs(C_vals))), 1e-12)
+        delta_c_cut = max(min_delta_c, rel_delta_c * c_scale)
+
+        signs = np.zeros(d_log.size, dtype=int)
+        signs[d_log > eps] = 1
+        signs[d_log < -eps] = -1
+
+        n_cps = 0
+        last_sign = 0
+        last_idx = None
+        for i, s in enumerate(signs):
+            if s == 0:
+                continue
+            if last_sign != 0 and s != last_sign:
+                if abs(C_vals[i] - C_vals[last_idx]) >= delta_c_cut:
+                    n_cps += 1
+            last_sign = s
+            last_idx = i
+
+        return n_cps, max_log_deriv
+
     except Exception as e:
         print(f"Error in count_critical_points: {e}")
         return None, None

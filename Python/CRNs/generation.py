@@ -213,6 +213,92 @@ def get_rates_from_exponents(r_n, species_energies, reaction_barriers, reaction_
     return reac_rates
 
 
+def classify_signaling_reaction_direction(r_n, reaction_idx: int) -> str:
+    """
+    Classify a signaling-network reaction as activating or deactivating.
+
+    Uses the same direction convention as GraphComputation.build_r_n_maps:
+      activation:   transforms S*j -> S*j  (inactive to active)
+      deactivation: transforms S*j  -> S*j (active to inactive)
+
+    Returns
+    -------
+    'activation', 'deactivation', or 'other'
+    """
+    reaction = r_n.reactions[reaction_idx]
+    src = r_n.all_complexes[reaction[0]].split('+')
+    dst = r_n.all_complexes[reaction[1]].split('+')
+
+    if len(src) == 1 and len(dst) == 1:
+        if src[0].endswith('s') and not dst[0].endswith('s'):
+            return 'activation'
+        if dst[0].endswith('s') and not src[0].endswith('s'):
+            return 'deactivation'
+        return 'other'
+
+    if len(src) == 2 and len(dst) == 2:
+        src_set, dst_set = set(src), set(dst)
+        common = src_set & dst_set
+        if len(common) != 1:
+            return 'other'
+        upstream = common.pop()
+        src_only = (src_set - {upstream}).pop()
+        dst_only = (dst_set - {upstream}).pop()
+        if src_only.endswith('s') and not dst_only.endswith('s'):
+            return 'activation'
+        if dst_only.endswith('s') and not src_only.endswith('s'):
+            return 'deactivation'
+
+    return 'other'
+
+
+def initialize_inactive_favoring_rates(
+    r_n,
+    activation_scale: float = -6.0,
+    deactivation_scale: float = 2.0,
+    baseline_scale: float = 0.0,
+    log_std: float = 0.5,
+    seed=None,
+):
+    """
+    Initialize reaction rates so substrates tend toward inactive (Ss) at steady state.
+
+    Activation reactions (Ss -> S and catalytic equivalents) are drawn with low
+    log-rates; deactivation reactions (S -> Ss) are drawn with high log-rates.
+    Unclassified reactions use baseline_scale.
+
+    Parameters
+    ----------
+    r_n : ReactionNetwork
+    activation_scale : log-mean for activation rates (default ~1e-3)
+    deactivation_scale : log-mean for deactivation rates (default ~7)
+    baseline_scale : log-mean for unclassified reactions
+    log_std : log-normal spread applied to all classes
+    seed : random seed for reproducibility
+
+    Returns
+    -------
+    rates : np.ndarray of initialized rate constants (also applied via r_n.update_rates)
+    """
+    rng = np.random.default_rng(seed)
+    n_rates = len(r_n.get_rates())
+    log_rates = np.full(n_rates, baseline_scale, dtype=float)
+
+    for i in range(n_rates):
+        direction = classify_signaling_reaction_direction(r_n, i)
+        if direction == 'activation':
+            mu = activation_scale
+        elif direction == 'deactivation':
+            mu = deactivation_scale
+        else:
+            mu = baseline_scale
+        log_rates[i] = mu + log_std * rng.standard_normal()
+
+    rates = np.exp(log_rates)
+    r_n.update_rates(rates)
+    return rates
+
+
 def generate_initial_concentrations(L, base_concentrations=None, scale=4, offset_scale=3):
     # Get nullspace basis vectors
     nullspace = sympy.Matrix(L).nullspace()
@@ -644,28 +730,67 @@ def generate_dag_signaling_network(NR, NS, p_f, p_r, include_reverse=False, incl
     
     return species_names, reaction_strings, L, adjacency_matrix, input_substrates_list
 
-def add_recurrent_connections(adjacency_matrix, reaction_strings, include_reverse, input_substrates_list, NR, NS, p_r, seed=None):
+def _io_simple_path_signature(G, NR, NS, n_outputs):
+    """Simple-path lists from every receptor R{i} to every output S{j}."""
+    n_outputs = int(n_outputs)
+    if n_outputs < 1 or n_outputs > NS:
+        raise ValueError(f"n_outputs must be in [1, NS], got n_outputs={n_outputs}, NS={NS}")
+    sig = {}
+    for i in range(NR):
+        src = f'R{i}'
+        for j in range(NS - n_outputs, NS):
+            tgt = f'S{j}'
+            paths = count_simple_paths(G, src, tgt)
+            if not paths:
+                sig[(src, tgt)] = ()
+            else:
+                sig[(src, tgt)] = tuple(tuple(p) for p in paths)
+    return sig
+
+
+def add_recurrent_connections(adjacency_matrix, reaction_strings, include_reverse, input_substrates_list, NR, NS, p_r, seed=None, n_outputs=1, allow_output_sources=True):
+    """
+    Add lower-triangular (backward) edges that do not create new I/O simple paths.
+
+    Inputs are receptors R0..R{NR-1}. Outputs are the last n_outputs substrates,
+    S{NS-n_outputs} .. S{NS-1} (last-layer class nodes in the layered generator).
+    Default n_outputs=1 matches the original DAG check R0 -> S{NS-1}.
+
+    If allow_output_sources is False, skip candidate edges whose source is an
+    output node (S_i -> S_j with i >= NS - n_outputs). Those edges never appear
+    on simple R -> output paths, so they would otherwise always be accepted.
+    """
     if seed is not None:
         np.random.seed(seed)
-    
+
+    n_outputs = int(n_outputs)
+    if n_outputs < 1 or n_outputs > NS:
+        raise ValueError(f"n_outputs must be in [1, NS], got n_outputs={n_outputs}, NS={NS}")
+
+    reaction_strings = list(reaction_strings)
     G_original = get_digraph_from_adjacency_matrix(adjacency_matrix, input_substrates_list, NR, NS)
     adjacency_matrix_copy = adjacency_matrix.copy()
-    n_paths = count_simple_paths(G_original, f'R0', f'S{NS-1}')
+    orig_paths = _io_simple_path_signature(G_original, NR, NS, n_outputs)
+    output_start = NS - n_outputs
     for i in range(1, NS):
+        if not allow_output_sources and i >= output_start:
+            continue
         for j in range(i):
+            if adjacency_matrix_copy[i, j] == 1:
+                continue
             if np.random.rand() < p_r:
                 adjacency_matrix_copy[i, j] = 1
                 G = get_digraph_from_adjacency_matrix(adjacency_matrix_copy, input_substrates_list, NR, NS)
-                if count_simple_paths(G, f'R0', f'S{NS-1}') != n_paths:
+                if _io_simple_path_signature(G, NR, NS, n_outputs) != orig_paths:
                     adjacency_matrix_copy[i, j] = 0
 
-    for i in range(NR):
-        for j in input_substrates_list[i]:
-            reac = f'R{i}+S{j}s -> R{i}+S{j}'
-            reaction_strings.append(reac)
-            if include_reverse:
-                reac = f'R{i}+S{j} -> R{i}+S{j}s'
-                reaction_strings.append(reac)
+    # Append substrate-substrate reactions for newly accepted edges only.
+    for i in range(NS):
+        for j in range(NS):
+            if adjacency_matrix_copy[i, j] == 1 and adjacency_matrix[i, j] != 1:
+                reaction_strings.append(f'S{i}+S{j}s -> S{i}+S{j}')
+                if include_reverse:
+                    reaction_strings.append(f'S{i}+S{j} -> S{i}+S{j}s')
 
     return reaction_strings, adjacency_matrix_copy
 
@@ -821,23 +946,24 @@ def expand_catalyzed_reactions(species_names, reaction_strings, L):
         # Create reaction 2: intermediate -> products (complex dissociation)
         reaction2 = f"{intermediate_name} -> {'+'.join(products)}"
         
-        return intermediate_name, reaction1, reaction2, list(set(reactants) | set(products))
+        return intermediate_name, reaction1, reaction2, reactants
 
     new_species_names = species_names.copy()
     new_reaction_strings = reaction_strings.copy()
     new_L = L.copy()
     for reaction_string in reaction_strings:
         if has_catalyst(reaction_string):
-            intermediate_name, reaction1, reaction2, involved_species = split_catalyzed_reaction(reaction_string)
-            involved_indices = [species_names.index(species) for species in involved_species]
+            intermediate_name, reaction1, reaction2, reactants = split_catalyzed_reaction(reaction_string)
+            reactant_indices = [species_names.index(species) for species in reactants]
             new_species_names.append(intermediate_name)
             new_reaction_strings.remove(reaction_string)
             new_reaction_strings.append(reaction1)
             new_reaction_strings.append(reaction2)
             new_l = np.zeros(len(new_L))
             for i in range(len(new_L)):
-                if L[i, involved_indices].sum() > 0:
-                    new_l[i] = 1
+                # Preserve conservation law stoichiometry for complex formation:
+                # the intermediate should carry the same conserved totals as all reactants.
+                new_l[i] = L[i, reactant_indices].sum()
             new_L = np.column_stack([new_L, new_l])
     
     return new_species_names, new_reaction_strings, new_L
@@ -1130,7 +1256,7 @@ def count_simple_paths(G, source, target):
     except nx.NetworkXNoPath:
         return 0
 
-def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR, NS, node_size=600, arrow_size=25, rad=0.4, num_outputs=1, font_size=12, ax=None, flip_horizontal=False):
+def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR, NS, node_size=600, arrow_size=25, rad=0.4, num_outputs=1, font_size=12, fig_size = (6, 6), ax=None, flip_horizontal=False):
     """
     Visualize the DAG signaling network including receptor connections.
     
@@ -1155,7 +1281,7 @@ def visualize_dag_signaling_network(adjacency_matrix, input_substrates_list, NR,
        
     # Create the plot if axis not provided
     if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 6))
+        fig, ax = plt.subplots(figsize=fig_size)
         return_fig = True
     else:
         fig = ax.get_figure()

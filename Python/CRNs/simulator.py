@@ -396,17 +396,45 @@ class ReactionNetworkSimulator:
             remaining_syms: list of sympy symbols for the remaining species
         """
         reduced_rhs, remaining_syms, const_syms, rate_syms = self.get_symbolic_reduced_rhs()
-        arg_syms = list(remaining_syms) + list(const_syms) + list(rate_syms)
+        
+        n_remaining = len(remaining_syms)
+        n_const = len(const_syms)
+        n_rates = len(rate_syms)
+        total_args = n_remaining + n_const + n_rates
         
         # First-order derivatives (independent of each other)
         dR_dC = sympy.Matrix(reduced_rhs).jacobian(remaining_syms)
-        dR_dC_func = sympy.lambdify(arg_syms, dR_dC, modules='numpy')
-
         dR_dl = sympy.Matrix(reduced_rhs).jacobian(const_syms)
-        dR_dl_func = sympy.lambdify(arg_syms, dR_dl, modules='numpy')
-
         dR_dk = sympy.Matrix(reduced_rhs).jacobian(rate_syms)
-        dR_dk_func = sympy.lambdify(arg_syms, dR_dk, modules='numpy')
+        
+        # Workaround for Python's 255 argument limit in function definitions
+        if total_args > 250:  # Leave margin below hard limit of 255
+            print(f"System has {total_args} parameters (>250). Using array-based lambdify to avoid Python's 255 argument limit.")
+            
+            # Use array-based lambdify: pass 3 array arguments instead of 255+ scalars
+            dR_dC_func_base = sympy.lambdify([remaining_syms, const_syms, rate_syms], dR_dC, modules='numpy')
+            dR_dl_func_base = sympy.lambdify([remaining_syms, const_syms, rate_syms], dR_dl, modules='numpy')
+            dR_dk_func_base = sympy.lambdify([remaining_syms, const_syms, rate_syms], dR_dk, modules='numpy')
+            
+            # Wrap to maintain backward compatibility with code expecting unpacked args
+            def make_wrapper(func_base, n_remaining, n_const, n_rates):
+                def wrapper(*args):
+                    # Split flat argument list into three arrays
+                    C_args = list(args[:n_remaining])
+                    l_args = list(args[n_remaining:n_remaining + n_const])
+                    k_args = list(args[n_remaining + n_const:])
+                    return func_base(C_args, l_args, k_args)
+                return wrapper
+            
+            dR_dC_func = make_wrapper(dR_dC_func_base, n_remaining, n_const, n_rates)
+            dR_dl_func = make_wrapper(dR_dl_func_base, n_remaining, n_const, n_rates)
+            dR_dk_func = make_wrapper(dR_dk_func_base, n_remaining, n_const, n_rates)
+        else:
+            # Standard approach for smaller systems (better performance)
+            arg_syms = list(remaining_syms) + list(const_syms) + list(rate_syms)
+            dR_dC_func = sympy.lambdify(arg_syms, dR_dC, modules='numpy')
+            dR_dl_func = sympy.lambdify(arg_syms, dR_dl, modules='numpy')
+            dR_dk_func = sympy.lambdify(arg_syms, dR_dk, modules='numpy')
         
         return dR_dC, dR_dC_func, dR_dl, dR_dl_func, dR_dk, dR_dk_func, remaining_syms
 

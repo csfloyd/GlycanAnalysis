@@ -12,6 +12,9 @@ from .generation import *
 from .utils import *
 from .sgolay2 import *
 from .training import *
+from .regularizers import *
+from .mi_estimators import *
+from .mi_training import *
 
 # Automatically build __all__ from all imported names
 __all__ = [name for name in globals() if not name.startswith('_')]

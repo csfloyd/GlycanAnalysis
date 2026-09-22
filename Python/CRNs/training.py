@@ -6,11 +6,16 @@ This module contains functions for training reaction networks.
 
 import numpy as np
 import networkx as nx
+import signal
+from itertools import product
 from typing import List, Dict, Tuple, Iterator, Optional
 from abc import ABC, abstractmethod
 import sympy
 from scipy.optimize import nnls
 from scipy.optimize import minimize
+
+from CRNs.regularizers import _active_form_index, _group_substrate_forms, _parse_substrate_species
+from CRNs.utils import timeout_handler
 
 
 # ============== ABSTRACT BASE CLASS ==============
@@ -112,8 +117,122 @@ class MLPModel(ForwardModel):
     def get_param_shapes(self) -> Dict[str, Tuple]:
         return {'params': (self.mlp.get_param_count(),)}
 
+    def get_regularization_state(self) -> Dict:
+        """
+        Extract state for MLP regularizers (call after forward()).
+
+        Returns hidden post-activation vector from the penultimate layer.
+        """
+        if not hasattr(self.mlp, 'activations') or len(self.mlp.activations) < 3:
+            raise RuntimeError("Must call forward() before getting regularization state")
+        if self.mlp.n_layers < 2:
+            raise RuntimeError("MLP must have at least one hidden layer for regularization")
+        return {
+            'hidden_activations': self.mlp.activations[-2].copy(),
+            'penultimate_index': len(self.mlp.activations) - 2,
+            'mlp': self.mlp,
+        }
+    
+    def get_penultimate_activations(self) -> np.ndarray:
+        """
+        Extract penultimate layer activations under sigmoid (for MI training).
+        
+        Returns h ∈ [0,1]^d suitable for use as Bernoulli parameters.
+        Must be called after forward().
+        """
+        if not hasattr(self.mlp, 'activations') or len(self.mlp.activations) < 3:
+            raise RuntimeError("Must call forward() before getting penultimate activations")
+        if self.mlp.n_layers < 2:
+            raise RuntimeError("MLP must have at least one hidden layer")
+        
+        # Get pre-activation (linear output) of penultimate layer
+        penultimate_pre = self.mlp.pre_activations[-2]
+        
+        # Apply sigmoid to get h ∈ [0,1]
+        h = 1.0 / (1.0 + np.exp(-np.clip(penultimate_pre, -500, 500)))
+        
+        return h
+
+
+# ============== LINEAR READOUT ==============
+
+def identify_hidden_species_indices(
+    species_names: List[str],
+    class_ids: List[int],
+    n_inputs: int,
+) -> List[int]:
+    """Species indices for hidden substrates (not receptors or class outputs)."""
+    output_names = {species_names[idx] for idx in class_ids}
+    hidden_indices = []
+    for i, name in enumerate(species_names):
+        parsed = _parse_substrate_species(name)
+        if parsed is None:
+            continue
+        base_name = name.rstrip('s')
+        if base_name in output_names or name in output_names:
+            continue
+        hidden_indices.append(i)
+    return hidden_indices
+
+
+def build_hidden_readout_groups(
+    species_names: List[str],
+    hidden_indices: List[int],
+) -> List[Dict]:
+    """
+    Ordered hidden substrate groups for linear readout.
+
+    Each group is one hidden node (active + inactive phosphoforms).
+    """
+    substrate_groups = _group_substrate_forms(species_names, list(hidden_indices))
+    groups = []
+    for base_id in sorted(substrate_groups.keys()):
+        forms = sorted(substrate_groups[base_id], key=lambda x: x[0])
+        if len(forms) < 2:
+            continue
+        active_idx = _active_form_index(forms)
+        groups.append({
+            'base_id': base_id,
+            'active_idx': active_idx,
+            'form_indices': [idx for _, idx, _ in forms],
+        })
+    return groups
+
+
+def extract_hidden_vector(
+    C_full: np.ndarray,
+    hidden_groups: List[Dict],
+) -> np.ndarray:
+    """Build h from raw active-form concentrations at hidden substrates."""
+    h = np.zeros(len(hidden_groups), dtype=float)
+    for m, group in enumerate(hidden_groups):
+        h[m] = C_full[group['active_idx']]
+    return h
+
+
+def hidden_jacobian_wrt_C(
+    n_species: int,
+    hidden_groups: List[Dict],
+) -> np.ndarray:
+    """Jacobian dh/dC with shape (n_hidden, n_species) for raw active concentrations."""
+    dh_dC = np.zeros((len(hidden_groups), n_species), dtype=float)
+    for m, group in enumerate(hidden_groups):
+        dh_dC[m, group['active_idx']] = 1.0
+    return dh_dC
+
 
 # ============== CRN MODEL ==============
+
+def _softmax_jacobian(probs: np.ndarray, temperature: float) -> np.ndarray:
+    return (np.diag(probs) - np.outer(probs, probs)) / temperature
+
+
+def _cross_entropy_logit_grad(probs: np.ndarray, target_idx: int, temperature: float) -> np.ndarray:
+    """dL/dy for softmax + cross-entropy with temperature T."""
+    one_hot = np.zeros_like(probs)
+    one_hot[target_idx] = 1.0
+    return (probs - one_hot) / temperature
+
 
 class CRNModel(ForwardModel):
     """CRN-based forward model with analytical gradients.
@@ -121,6 +240,10 @@ class CRNModel(ForwardModel):
     Supports multiple forward computation methods:
     - 'ode': Full ODE integration to steady state (accurate, slow)
     - 'graph': Fast graph-based approximation
+    
+    Readout options:
+    - 'biochemical': class logits = steady-state output species concentrations
+    - 'linear': class logits = W @ h + b from hidden active concentrations h
     
     Both methods use the same analytical gradient computation.
     """
@@ -138,16 +261,21 @@ class CRNModel(ForwardModel):
                  dR_dk_func=None,
                  dR_dl_func=None,
                  generate_init_func=None,
+                 readout_type: str = 'biochemical',
+                 readout_init_std: Optional[float] = None,
+                 readout_seed: Optional[int] = None,
                  t_span: Tuple[float, float] = (0, 100000),
                  num_points: int = 10000,
                  rtol: float = 1e-12,
-                 atol: float = 1e-12):
+                 atol: float = 1e-12,
+                 timeout_seconds: Optional[int] = 5):
         """
         Args:
             r_n: ReactionNetwork instance
             sim: Simulator instance
             L: Conservation law matrix
-            class_ids: indices of output species (target nodes)
+            class_ids: indices of output species (target nodes) for biochemical readout,
+                or class count anchors for linear readout (hidden nodes excluded from h)
             n_inputs: number of input species (receptors)
             default_l0: default conservation constants
             forward_method: 'ode' or 'graph'
@@ -156,16 +284,25 @@ class CRNModel(ForwardModel):
             dR_dk_func: Jacobian dR/dk function  
             dR_dl_func: Jacobian dR/dl function
             generate_init_func: function to generate initial concentrations from l0
+            readout_type: 'biochemical' or 'linear'
+            readout_init_std: std dev for initializing W (default: Xavier-like)
+            readout_seed: RNG seed for linear readout initialization
             t_span: ODE integration time span
             num_points: number of ODE integration points
             rtol, atol: ODE integration tolerances
+            timeout_seconds: max seconds for a single ODE integration; None or 0 disables.
+                Timed-out samples are skipped (same as sampling). SIGALRM, so Linux/SLURM only.
         """
+        if readout_type not in ('biochemical', 'linear'):
+            raise ValueError(f"Unknown readout_type: {readout_type}")
+
         self.r_n = r_n
         self.sim = sim
         self.L = L
         self.class_ids = class_ids
         self.n_classes = len(class_ids)
         self.n_inputs = n_inputs
+        self.readout_type = readout_type
         
         self.forward_method = forward_method
         self.graph_comp = graph_comp
@@ -181,6 +318,8 @@ class CRNModel(ForwardModel):
         self.num_points = num_points
         self.rtol = rtol
         self.atol = atol
+        self.timeout_seconds = timeout_seconds
+        self.n_integration_timeouts = 0
         
         # Parameters
         self._rates = np.array(r_n.get_rates())
@@ -188,6 +327,29 @@ class CRNModel(ForwardModel):
         
         # Indices for trainable l0 (typically exclude inputs and outputs)
         self.l0_train_range = (n_inputs, len(default_l0) - len(class_ids))
+
+        # Linear readout: h -> y = W h + b
+        self._hidden_groups = []
+        self._W = None
+        self._b = None
+        self._h = None
+        if readout_type == 'linear':
+            hidden_indices = identify_hidden_species_indices(
+                r_n.species_names, class_ids, n_inputs
+            )
+            self._hidden_groups = build_hidden_readout_groups(
+                r_n.species_names, hidden_indices
+            )
+            n_hidden = len(self._hidden_groups)
+            if n_hidden == 0:
+                raise ValueError(
+                    "linear readout requires at least one hidden substrate node"
+                )
+            rng = np.random.default_rng(readout_seed)
+            if readout_init_std is None:
+                readout_init_std = np.sqrt(2.0 / (n_hidden + self.n_classes))
+            self._W = rng.normal(0.0, readout_init_std, size=(self.n_classes, n_hidden))
+            self._b = np.zeros(self.n_classes, dtype=float)
         
         # Cached forward pass results
         self._C_full = None
@@ -226,20 +388,38 @@ class CRNModel(ForwardModel):
         self._C_full = C_full
         self._C_reduced_final = C_reduced
         
-        # Extract class outputs
-        return np.array([C_full[idx] for idx in self.class_ids])
+        if self.readout_type == 'biochemical':
+            return np.array([C_full[idx] for idx in self.class_ids])
+
+        self._h = extract_hidden_vector(C_full, self._hidden_groups)
+        return self._W @ self._h + self._b
     
     def _forward_ode(self, l0: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Forward pass via ODE integration."""
         C_full = self.generate_init_func(self.L, l0)
         _, C_reduced_init = self.sim.get_const_and_reduced_init(C_full)
         self.sim.make_reduced_rhs_with_conservation(l0)
-        
-        sol_reduced, C_reduced_final = self.sim.integrate(
-            self.sim.reduced_ode_rhs, C_reduced_init,
-            t_span=self.t_span, num_points=self.num_points,
-            method='LSODA', rtol=self.rtol, atol=self.atol
+
+        use_timeout = (
+            self.timeout_seconds is not None
+            and self.timeout_seconds > 0
+            and hasattr(signal, 'SIGALRM')
         )
+        if use_timeout:
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(int(self.timeout_seconds))
+        try:
+            sol_reduced, C_reduced_final = self.sim.integrate(
+                self.sim.reduced_ode_rhs, C_reduced_init,
+                t_span=self.t_span, num_points=self.num_points,
+                method='LSODA', rtol=self.rtol, atol=self.atol
+            )
+        except TimeoutError:
+            self.n_integration_timeouts += 1
+            raise
+        finally:
+            if use_timeout:
+                signal.alarm(0)
         
         C_full = self.sim.recover_eliminated_species(l0, C_reduced_final)
         return C_full, C_reduced_final
@@ -254,105 +434,179 @@ class CRNModel(ForwardModel):
         
         return C_full, C_reduced
     
+    def _compute_sensitivity_matrices(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return full dC/dk and dC/dl matrices at the cached steady state."""
+        dC_dk = self.sim.dC_dk_func(
+            self._C_reduced_final, self._current_l0, self._rates,
+            self.dR_dC_func, self.dR_dk_func
+        )
+        dC_dk_full = self.sim.compute_dC_dk_full(dC_dk, l_bool=False)
+
+        dC_dl = self.sim.dC_dl_func(
+            self._C_reduced_final, self._current_l0, self._rates,
+            self.dR_dC_func, self.dR_dl_func
+        )
+        dC_dl_full = self.sim.compute_dC_dk_full(dC_dl, l_bool=True)
+        return dC_dk_full, dC_dl_full
+
+    def _readout_jacobian_wrt_C(self) -> np.ndarray:
+        """
+        dy/dC with shape (n_classes, n_species).
+
+        Biochemical readout: rows are unit vectors at class species indices.
+        Linear readout: W @ dh/dC.
+        """
+        n_species = len(self.r_n.species_names)
+        if self.readout_type == 'biochemical':
+            dy_dC = np.zeros((self.n_classes, n_species), dtype=float)
+            for i, idx in enumerate(self.class_ids):
+                dy_dC[i, idx] = 1.0
+            return dy_dC
+
+        dh_dC = hidden_jacobian_wrt_C(n_species, self._hidden_groups)
+        return self._W @ dh_dC
+
+    def _backward_from_dy_dparams(
+        self,
+        dL_dy: np.ndarray,
+        dC_dk_full: np.ndarray,
+        dC_dl_full: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        """Chain dL/dy through readout and sensitivities to trainable parameters."""
+        dy_dC = self._readout_jacobian_wrt_C()
+        dL_dC = dL_dy @ dy_dC
+        grad_k = dL_dC @ dC_dk_full
+        grad_l = dL_dC @ dC_dl_full
+        grads = {
+            'log_rates': grad_k * self._rates,
+            'log_l0': grad_l * self._default_l0,
+        }
+        if self.readout_type == 'linear':
+            grads['W'] = np.outer(dL_dy, self._h)
+            grads['b'] = dL_dy.copy()
+        return grads
+    
     def backward(self, probs: np.ndarray, target_idx: int, temperature: float = 1.0) -> Dict[str, np.ndarray]:
         """Compute analytical gradients w.r.t. rates and l0.
         
         Uses dC_dk and dC_dl sensitivity functions evaluated at steady state.
         """
-        l0 = self._current_l0
-        rates = self._rates
-        C_reduced = self._C_reduced_final
-        
-        # Compute sensitivity matrices at steady state
-        dC_dk = self.sim.dC_dk_func(
-            C_reduced, l0, rates, self.dR_dC_func, self.dR_dk_func
-        )
-        dC_dk_full = self.sim.compute_dC_dk_full(dC_dk, l_bool=False)
-        
-        dC_dl = self.sim.dC_dl_func(
-            C_reduced, l0, rates, self.dR_dC_func, self.dR_dl_func
-        )
-        dC_dl_full = self.sim.compute_dC_dk_full(dC_dl, l_bool=True)
-        
-        # Compute softmax Jacobian: dp/dC = (diag(p) - outer(p,p)) / T
-        softmax_jacobian = (np.diag(probs) - np.outer(probs, probs)) / temperature
-        
-        # Extract sensitivities at class nodes
-        dC_dk_class = np.array([dC_dk_full[idx] for idx in self.class_ids])
-        dC_dl_class = np.array([dC_dl_full[idx] for idx in self.class_ids])
-        
-        # dp/dk = (dp/dC) @ (dC/dk)
-        dprobs_dk = softmax_jacobian @ dC_dk_class
-        dprobs_dl = softmax_jacobian @ dC_dl_class
-        
-        # Cross-entropy gradient: dL/dk = -dp[target]/dk / (p[target] + eps)
-        eps = 1e-8
-        grad_k = -dprobs_dk[target_idx] / (probs[target_idx] + eps)
-        grad_l = -dprobs_dl[target_idx] / (probs[target_idx] + eps)
-        
-        # Chain rule for log-space parameters
-        return {
-            'log_rates': grad_k * self._rates,
-            'log_l0': grad_l * self._default_l0
-        }
+        dC_dk_full, dC_dl_full = self._compute_sensitivity_matrices()
+
+        if self.readout_type == 'biochemical':
+            softmax_jacobian = _softmax_jacobian(probs, temperature)
+            dC_dk_class = np.array([dC_dk_full[idx] for idx in self.class_ids])
+            dC_dl_class = np.array([dC_dl_full[idx] for idx in self.class_ids])
+            dprobs_dk = softmax_jacobian @ dC_dk_class
+            dprobs_dl = softmax_jacobian @ dC_dl_class
+
+            eps = 1e-8
+            grad_k = -dprobs_dk[target_idx] / (probs[target_idx] + eps)
+            grad_l = -dprobs_dl[target_idx] / (probs[target_idx] + eps)
+            return {
+                'log_rates': grad_k * self._rates,
+                'log_l0': grad_l * self._default_l0
+            }
+
+        dL_dy = _cross_entropy_logit_grad(probs, target_idx, temperature)
+        return self._backward_from_dy_dparams(dL_dy, dC_dk_full, dC_dl_full)
     
     def backward_mse(self, probs: np.ndarray, target_vec: np.ndarray, temperature: float = 1.0) -> Dict[str, np.ndarray]:
         """Compute analytical gradients for MSE loss."""
-        l0 = self._current_l0
-        rates = self._rates
-        C_reduced = self._C_reduced_final
-        
-        # Compute sensitivity matrices
-        dC_dk = self.sim.dC_dk_func(
-            C_reduced, l0, rates, self.dR_dC_func, self.dR_dk_func
-        )
-        dC_dk_full = self.sim.compute_dC_dk_full(dC_dk, l_bool=False)
-        
-        dC_dl = self.sim.dC_dl_func(
-            C_reduced, l0, rates, self.dR_dC_func, self.dR_dl_func
-        )
-        dC_dl_full = self.sim.compute_dC_dk_full(dC_dl, l_bool=True)
-        
-        # Softmax Jacobian
-        softmax_jacobian = (np.diag(probs) - np.outer(probs, probs)) / temperature
-        
-        # Extract at class nodes
-        dC_dk_class = np.array([dC_dk_full[idx] for idx in self.class_ids])
-        dC_dl_class = np.array([dC_dl_full[idx] for idx in self.class_ids])
-        
-        dprobs_dk = softmax_jacobian @ dC_dk_class
-        dprobs_dl = softmax_jacobian @ dC_dl_class
-        
-        # MSE gradient: dL/dp = (p - y), then chain through softmax
-        diff = probs - target_vec
-        grad_k = np.sum(diff[:, None] * dprobs_dk, axis=0)
-        grad_l = np.sum(diff[:, None] * dprobs_dl, axis=0)
-        
-        return {
-            'log_rates': grad_k * self._rates,
-            'log_l0': grad_l * self._default_l0
-        }
+        dC_dk_full, dC_dl_full = self._compute_sensitivity_matrices()
+
+        if self.readout_type == 'biochemical':
+            softmax_jacobian = _softmax_jacobian(probs, temperature)
+            dC_dk_class = np.array([dC_dk_full[idx] for idx in self.class_ids])
+            dC_dl_class = np.array([dC_dl_full[idx] for idx in self.class_ids])
+            dprobs_dk = softmax_jacobian @ dC_dk_class
+            dprobs_dl = softmax_jacobian @ dC_dl_class
+
+            diff = probs - target_vec
+            grad_k = np.sum(diff[:, None] * dprobs_dk, axis=0)
+            grad_l = np.sum(diff[:, None] * dprobs_dl, axis=0)
+            return {
+                'log_rates': grad_k * self._rates,
+                'log_l0': grad_l * self._default_l0
+            }
+
+        softmax_jacobian = _softmax_jacobian(probs, temperature)
+        dL_dy = softmax_jacobian.T @ (probs - target_vec)
+        return self._backward_from_dy_dparams(dL_dy, dC_dk_full, dC_dl_full)
     
     def get_params(self) -> Dict[str, np.ndarray]:
-        return {
+        params = {
             'log_rates': np.log(self._rates),
-            'log_l0': np.log(self._default_l0)
+            'log_l0': np.log(self._default_l0),
         }
+        if self.readout_type == 'linear':
+            params['W'] = self._W.copy()
+            params['b'] = self._b.copy()
+        return params
     
     def set_params(self, params_dict: Dict[str, np.ndarray]):
         self._rates = np.exp(params_dict['log_rates'])
         self._default_l0 = np.exp(params_dict['log_l0'])
         self.r_n.update_rates(self._rates)
+        if self.readout_type == 'linear':
+            self._W = np.array(params_dict['W'], dtype=float)
+            self._b = np.array(params_dict['b'], dtype=float)
     
     def get_param_shapes(self) -> Dict[str, Tuple]:
-        return {
+        shapes = {
             'log_rates': self._rates.shape,
-            'log_l0': self._default_l0.shape
+            'log_l0': self._default_l0.shape,
         }
+        if self.readout_type == 'linear':
+            shapes['W'] = self._W.shape
+            shapes['b'] = self._b.shape
+        return shapes
     
     def get_C_full(self) -> np.ndarray:
         """Return the full concentration vector from last forward pass."""
         return self._C_full
+    
+    def get_regularization_state(self) -> Dict:
+        """
+        Extract state information needed for regularization computations.
+        
+        Must be called after forward() to have valid state.
+        
+        Returns:
+            state_dict: Dictionary containing:
+                - 'C_full': Full concentration vector (all species)
+                - 'C_reduced': Reduced concentration vector (remaining species)
+                - 'l0': Conservation constants
+                - 'rates': Rate constants
+                - 'species_names': List of species names
+                - 'hidden_indices': Indices of hidden substrate nodes in C_full
+                - 'class_ids': Indices of output nodes
+                - 'n_inputs': Number of input nodes
+        """
+        if self._C_full is None:
+            raise RuntimeError("Must call forward() before getting regularization state")
+        
+        # Identify hidden node indices
+        hidden_indices = identify_hidden_species_indices(
+            self.r_n.species_names, self.class_ids, self.n_inputs
+        )
+        
+        state = {
+            'C_full': self._C_full.copy(),
+            'C_reduced': self._C_reduced_final.copy() if self._C_reduced_final is not None else None,
+            'l0': self._current_l0.copy() if self._current_l0 is not None else self._default_l0.copy(),
+            'rates': self._rates.copy(),
+            'species_names': self.r_n.species_names.copy(),
+            'hidden_indices': hidden_indices,
+            'class_ids': self.class_ids,
+            'n_inputs': self.n_inputs,
+            'readout_type': self.readout_type,
+        }
+        if self.readout_type == 'linear' and self._h is not None:
+            state['hidden_activations'] = self._h.copy()
+            state['readout_W'] = self._W.copy()
+            state['readout_b'] = self._b.copy()
+        return state
 
 
 # ============== UNIFIED TRAINER ==============
@@ -370,7 +624,10 @@ class UnifiedTrainer:
                  eps: float = 1e-8,
                  max_grad_norm: float = 50.0,
                  loss_type: str = 'cross_entropy',
-                 frozen_params: Optional[List[str]] = None):
+                 frozen_params: Optional[List[str]] = None,
+                 regularizers: Optional[List] = None,
+                 reg_schedule_type: str = 'none',
+                 reg_schedule_params: Optional[Dict] = None):
         """
         Args:
             model: ForwardModel instance (MLPModel or CRNModel)
@@ -381,6 +638,17 @@ class UnifiedTrainer:
             max_grad_norm: gradient clipping threshold
             loss_type: 'cross_entropy' or 'mse'
             frozen_params: list of parameter names to freeze (e.g. ['log_l0'])
+            regularizers: list of Regularizer objects (optional)
+            reg_schedule_type: Regularization weight scheduling type:
+                - 'none': No scheduling (constant weight)
+                - 'linear_warmup': Linear increase from 0 to 1
+                - 'exponential_warmup': Exponential increase to 1
+                - 'delayed': Step function (0 until delay_batches, then 1)
+                - 'cosine_warmup': Cosine-based smooth warmup
+            reg_schedule_params: Parameters for scheduling:
+                - 'warmup_batches': Number of batches for warmup (linear, exponential, cosine)
+                - 'delay_batches': Number of batches before activation (delayed)
+                - 'tau': Time constant for exponential (default: warmup_batches/3)
         """
         self.model = model
         self.optimizer_type = optimizer_type
@@ -392,6 +660,11 @@ class UnifiedTrainer:
         self.max_grad_norm = max_grad_norm
         self.loss_type = loss_type
         self.frozen_params = set(frozen_params) if frozen_params else set()
+        self.regularizers = regularizers if regularizers else []
+        
+        # Regularization scheduling
+        self.reg_schedule_type = reg_schedule_type
+        self.reg_schedule_params = reg_schedule_params or {}
         
         # Initialize Adam state for each parameter group
         self.m = {}  # first moment
@@ -401,6 +674,42 @@ class UnifiedTrainer:
         for name, shape in model.get_param_shapes().items():
             self.m[name] = np.zeros(shape)
             self.v[name] = np.zeros(shape)
+    
+    def get_regularizer_schedule_factor(self, batch_num: int) -> float:
+        """
+        Compute regularization weight multiplier based on schedule.
+        
+        Args:
+            batch_num: Current batch number (0-indexed)
+            
+        Returns:
+            factor: Multiplier in [0, 1] to apply to regularizer weights
+        """
+        if self.reg_schedule_type == 'none':
+            return 1.0
+        
+        elif self.reg_schedule_type == 'linear_warmup':
+            warmup_batches = self.reg_schedule_params.get('warmup_batches', 500)
+            return min(1.0, batch_num / max(1, warmup_batches))
+        
+        elif self.reg_schedule_type == 'exponential_warmup':
+            warmup_batches = self.reg_schedule_params.get('warmup_batches', 500)
+            tau = self.reg_schedule_params.get('tau', warmup_batches / 3.0)
+            return 1.0 - np.exp(-batch_num / max(1, tau))
+        
+        elif self.reg_schedule_type == 'delayed':
+            delay_batches = self.reg_schedule_params.get('delay_batches', 500)
+            return 1.0 if batch_num >= delay_batches else 0.0
+        
+        elif self.reg_schedule_type == 'cosine_warmup':
+            warmup_batches = self.reg_schedule_params.get('warmup_batches', 500)
+            if batch_num >= warmup_batches:
+                return 1.0
+            progress = batch_num / max(1, warmup_batches)
+            return 0.5 * (1.0 - np.cos(np.pi * progress))
+        
+        else:
+            raise ValueError(f"Unknown reg_schedule_type: {self.reg_schedule_type}")
     
     def softmax(self, outputs: np.ndarray, temperature: float = 1.0) -> np.ndarray:
         """Softmax with temperature scaling."""
@@ -428,8 +737,8 @@ class UnifiedTrainer:
         return grad, grad_norm, False
     
     def train_step(self, inputs, target_idx: int, temperature: float = 1.0,
-                   noise_scale: float = 0.0) -> Tuple[float, np.ndarray, Dict[str, float]]:
-        """Single training step.
+                   noise_scale: float = 0.0) -> Tuple[float, np.ndarray, Dict[str, float], Dict[str, float]]:
+        """Single training step with optional regularization.
         
         Args:
             inputs: input values for the model
@@ -438,18 +747,76 @@ class UnifiedTrainer:
             noise_scale: gradient noise scale (0 = no noise)
             
         Returns:
-            loss: scalar loss value
+            loss: scalar loss value (classification + regularization)
             probs: probability vector
             grad_norms: dict of gradient norms per parameter
+            reg_values: dict of raw regularizer metric values (name -> raw metric, not weighted penalty)
         """
         # Forward pass
         outputs = self.model.forward(inputs)
         probs = self.softmax(outputs, temperature)
         
-        # Compute loss
-        loss = self.compute_loss(probs, target_idx)
+        # Compute classification loss
+        class_loss = self.compute_loss(probs, target_idx)
         
-        # Backward pass
+        # Compute regularization penalties (if any)
+        reg_loss = 0.0
+        reg_breakdown = {}  # For logging individual regularizer contributions
+        reg_metrics = {}  # For logging the raw metric values (not penalties)
+        
+        if len(self.regularizers) > 0 and isinstance(self.model, CRNModel):
+            try:
+                # Get model state for regularization
+                state_dict = self.model.get_regularization_state()
+                
+                # Get schedule factor (0 to 1 based on training progress)
+                schedule_factor = self.get_regularizer_schedule_factor(self.t)
+                
+                # Compute penalty from each regularizer
+                for reg in self.regularizers:
+                    try:
+                        penalty = reg.compute_penalty(state_dict)
+                        # Apply both regularizer weight AND schedule factor
+                        weighted_penalty = reg.weight * schedule_factor * penalty
+                        reg_loss += weighted_penalty
+                        reg_breakdown[reg.name] = weighted_penalty
+                        
+                        # Compute raw metric value
+                        metric_value = reg.compute_metric(state_dict)
+                        reg_metrics[reg.name] = metric_value
+                    except NotImplementedError:
+                        # Regularizer not yet implemented, skip
+                        pass
+                    except Exception as e:
+                        print(f"Warning: Regularizer {reg.name} failed: {e}")
+            except Exception as e:
+                print(f"Warning: Could not compute regularization: {e}")
+
+        elif len(self.regularizers) > 0 and isinstance(self.model, MLPModel):
+            try:
+                state_dict = self.model.get_regularization_state()
+                schedule_factor = self.get_regularizer_schedule_factor(self.t)
+
+                for reg in self.regularizers:
+                    if not hasattr(reg, 'compute_gradients_mlp'):
+                        continue
+                    try:
+                        penalty = reg.compute_penalty(state_dict)
+                        weighted_penalty = reg.weight * schedule_factor * penalty
+                        reg_loss += weighted_penalty
+                        reg_breakdown[reg.name] = weighted_penalty
+                        reg_metrics[reg.name] = reg.compute_metric(state_dict)
+                    except NotImplementedError:
+                        pass
+                    except Exception as e:
+                        print(f"Warning: Regularizer {reg.name} failed: {e}")
+            except Exception as e:
+                print(f"Warning: Could not compute regularization: {e}")
+        
+        # Total loss
+        total_loss = class_loss + reg_loss
+        
+        # Backward pass: classification gradients
         if self.loss_type == 'cross_entropy':
             grads = self.model.backward(probs, target_idx, temperature)
         elif self.loss_type == 'mse':
@@ -458,6 +825,66 @@ class UnifiedTrainer:
             grads = self.model.backward_mse(probs, target_vec, temperature)
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
+        
+        # Add regularization gradients (if applicable and implemented)
+        if len(self.regularizers) > 0 and isinstance(self.model, CRNModel):
+            try:
+                # Get sensitivity matrices for gradient computation
+                C_reduced = state_dict['C_reduced']
+                l0 = state_dict['l0']
+                rates = state_dict['rates']
+                
+                # Compute sensitivity matrices
+                dC_dk = self.model.sim.dC_dk_func(
+                    C_reduced, l0, rates, 
+                    self.model.dR_dC_func, self.model.dR_dk_func
+                )
+                dC_dl = self.model.sim.dC_dl_func(
+                    C_reduced, l0, rates,
+                    self.model.dR_dC_func, self.model.dR_dl_func
+                )
+                
+                # Compute full dC/dk including eliminated species
+                dC_dk_full = self.model.sim.compute_dC_dk_full(dC_dk, l_bool=False)
+                dC_dl_full = self.model.sim.compute_dC_dk_full(dC_dl, l_bool=True)
+                
+                # Add gradients from each regularizer (with schedule factor applied)
+                for reg in self.regularizers:
+                    try:
+                        reg_grads = reg.compute_gradients(state_dict, dC_dk_full, dC_dl_full)
+                        
+                        # Apply schedule factor to regularizer gradients
+                        # (regularizers already include their weight, we multiply by schedule)
+                        for param_name, reg_grad in reg_grads.items():
+                            if param_name in grads:
+                                grads[param_name] = grads[param_name] + schedule_factor * reg_grad
+                    except NotImplementedError:
+                        # Regularizer not yet implemented, skip
+                        pass
+                    except Exception as e:
+                        print(f"Warning: Regularizer {reg.name} gradient failed: {e}")
+            except Exception as e:
+                print(f"Warning: Could not compute regularization gradients: {e}")
+
+        elif len(self.regularizers) > 0 and isinstance(self.model, MLPModel):
+            try:
+                state_dict = self.model.get_regularization_state()
+                schedule_factor = self.get_regularizer_schedule_factor(self.t)
+
+                for reg in self.regularizers:
+                    if not hasattr(reg, 'compute_gradients_mlp'):
+                        continue
+                    try:
+                        reg_grads = reg.compute_gradients_mlp(state_dict)
+                        for param_name, reg_grad in reg_grads.items():
+                            if param_name in grads:
+                                grads[param_name] = grads[param_name] + schedule_factor * reg_grad
+                    except NotImplementedError:
+                        pass
+                    except Exception as e:
+                        print(f"Warning: Regularizer {reg.name} gradient failed: {e}")
+            except Exception as e:
+                print(f"Warning: Could not compute regularization gradients: {e}")
         
         # Get current params
         params = self.model.get_params()
@@ -504,7 +931,7 @@ class UnifiedTrainer:
         
         self.model.set_params(params)
         
-        return loss, probs, grad_norms
+        return total_loss, probs, grad_norms, reg_metrics
     
     def compute_accuracy(self, probs: np.ndarray, target_idx: int) -> bool:
         """Check if prediction is correct."""
@@ -588,13 +1015,14 @@ def run_training(trainer: UnifiedTrainer,
         batch_correct = 0
         batch_valid = 0
         batch_grad_norms = None
+        batch_reg_values = {}  # Accumulate regularizer values
         
         for sample in range(batch_size):
             target_idx = random.randrange(n_classes)
             inputs = input_data.get_next_training_sample(target_idx)
             
             try:
-                loss, probs, grad_norms = trainer.train_step(
+                loss, probs, grad_norms, reg_values = trainer.train_step(
                     inputs=np.array(inputs).flatten(),
                     target_idx=target_idx,
                     temperature=temperature,
@@ -613,6 +1041,12 @@ def run_training(trainer: UnifiedTrainer,
                 batch_valid += 1
                 batch_grad_norms = grad_norms
                 
+                # Accumulate regularizer values (MLP version)
+                for reg_name, reg_value in reg_values.items():
+                    if reg_name not in batch_reg_values:
+                        batch_reg_values[reg_name] = 0.0
+                    batch_reg_values[reg_name] += reg_value
+                
             except Exception as e:
                 if verbose:
                     print(f"  Warning: Training step failed at batch {batch}, sample {sample}: {e}")
@@ -629,6 +1063,12 @@ def run_training(trainer: UnifiedTrainer,
         param_values = np.concatenate([p.flatten() for p in params.values()])
         param_stats = (param_values.min(), param_values.max(), param_values.mean())
         
+        # Average regularizer values
+        avg_reg_values = {name: val / batch_valid for name, val in batch_reg_values.items()}
+        
+        # Get current regularization schedule factor
+        reg_schedule_factor = trainer.get_regularizer_schedule_factor(batch)
+        
         # Record batch metrics
         history.record_batch(
             avg_loss=batch_loss / batch_valid,
@@ -636,7 +1076,9 @@ def run_training(trainer: UnifiedTrainer,
             grad_norms=batch_grad_norms if batch_grad_norms else {},
             temperature=temperature,
             noise_scale=noise_scale,
-            param_stats=param_stats
+            param_stats=param_stats,
+            regularizer_values=avg_reg_values,
+            reg_schedule_factor=reg_schedule_factor
         )
         
         # Print diagnostics
@@ -651,11 +1093,17 @@ def run_training(trainer: UnifiedTrainer,
                 else:
                     grad_str = " ".join([f"{k}:{v:.2e}" for k, v in batch_grad_norms.items()])
             
+            # Build regularizer string
+            reg_str = ""
+            if avg_reg_values:
+                reg_str = " | " + ", ".join([f"{k}:{v:.4f}" for k, v in avg_reg_values.items()])
+            
             print(f"Batch {batch:4d}/{num_batches} | "
                   f"Loss: {batch_loss/batch_valid:.4f} (avg: {recent_loss:.4f}) | "
                   f"Acc: {batch_correct/batch_valid:.1%} (avg: {recent_acc:.1%}) | "
                   f"{grad_str} | "
-                  f"T: {temperature:.2f}")
+                  f"T: {temperature:.2f}"
+                  f"{reg_str}")
     
     training_time = time.time() - start_time
     
@@ -698,6 +1146,9 @@ def run_training_crn(trainer: UnifiedTrainer,
         if hasattr(trainer.model, 'forward_method'):
             model_type = f"CRN ({trainer.model.forward_method})"
         print(f"Starting {model_type} training: {num_batches} batches, batch_size={batch_size}")
+        timeout_seconds = getattr(trainer.model, 'timeout_seconds', None)
+        if timeout_seconds:
+            print(f"ODE integration timeout: {timeout_seconds}s per sample")
         print("=" * 80)
     
     for batch in range(num_batches):
@@ -709,13 +1160,14 @@ def run_training_crn(trainer: UnifiedTrainer,
         batch_correct = 0
         batch_valid = 0
         batch_grad_norms = None
+        batch_reg_values = {}  # Accumulate regularizer values
         
         for sample in range(batch_size):
             target_idx = random.randrange(n_classes)
             inputs = input_data.get_next_training_sample(target_idx)
             
             try:
-                loss, probs, grad_norms = trainer.train_step(
+                loss, probs, grad_norms, reg_values = trainer.train_step(
                     inputs=inputs,  # CRN models handle input format internally
                     target_idx=target_idx,
                     temperature=temperature,
@@ -744,6 +1196,14 @@ def run_training_crn(trainer: UnifiedTrainer,
                 batch_valid += 1
                 batch_grad_norms = grad_norms
                 
+                # Accumulate regularizer values
+                for reg_name, reg_value in reg_values.items():
+                    if reg_name not in batch_reg_values:
+                        batch_reg_values[reg_name] = 0.0
+                    batch_reg_values[reg_name] += reg_value
+                
+            except TimeoutError:
+                continue
             except Exception as e:
                 if verbose:
                     print(f"  Warning: Training step failed at batch {batch}, sample {sample}: {e}")
@@ -764,6 +1224,12 @@ def run_training_crn(trainer: UnifiedTrainer,
             param_values = np.concatenate([p.flatten() for p in params.values()])
             param_stats = (param_values.min(), param_values.max(), param_values.mean())
         
+        # Average regularizer values
+        avg_reg_values = {name: val / batch_valid for name, val in batch_reg_values.items()}
+        
+        # Get current regularization schedule factor
+        reg_schedule_factor = trainer.get_regularizer_schedule_factor(batch)
+        
         # Record batch metrics
         history.record_batch(
             avg_loss=batch_loss / batch_valid,
@@ -771,7 +1237,9 @@ def run_training_crn(trainer: UnifiedTrainer,
             grad_norms=batch_grad_norms if batch_grad_norms else {},
             temperature=temperature,
             noise_scale=noise_scale,
-            param_stats=param_stats
+            param_stats=param_stats,
+            regularizer_values=avg_reg_values,
+            reg_schedule_factor=reg_schedule_factor
         )
         
         # Print diagnostics
@@ -783,14 +1251,26 @@ def run_training_crn(trainer: UnifiedTrainer,
             if batch_grad_norms:
                 grad_str = " ".join([f"{k[:6]}:{v:.2e}" for k, v in batch_grad_norms.items()])
             
+            # Build regularizer string
+            reg_str = ""
+            if avg_reg_values:
+                reg_str = " | " + ", ".join([f"{k}:{v:.4f}" for k, v in avg_reg_values.items()])
+            
+            # Add regularization schedule info if using schedule
+            if trainer.reg_schedule_type != 'none' and avg_reg_values:
+                reg_str += f" | RegSched: {reg_schedule_factor:.2f}"
+            
             pmin, pmax, _ = param_stats
             print(f"Batch {batch:4d}/{num_batches} | "
                   f"Loss: {batch_loss/batch_valid:.4f} (avg: {recent_loss:.4f}) | "
                   f"Acc: {batch_correct/batch_valid:.1%} (avg: {recent_acc:.1%}) | "
                   f"{grad_str} | "
-                  f"Rates: [{pmin:.2e}, {pmax:.2e}]")
+                  f"Rates: [{pmin:.2e}, {pmax:.2e}]"
+                  f"{reg_str}")
     
     training_time = time.time() - start_time
+    if hasattr(trainer.model, 'n_integration_timeouts'):
+        history.n_integration_timeouts = trainer.model.n_integration_timeouts
     
     if verbose:
         print("=" * 80)
@@ -1088,6 +1568,33 @@ class SimpleMLP:
         
         return grad_weights, grad_biases
     
+    def backprop_from_post_activation_grad(self, activation_index: int, dL_da: np.ndarray):
+        """
+        Backprop from gradient w.r.t. post-activation at activations[activation_index].
+
+        Layers above activation_index (e.g. readout) receive zero gradient.
+        Returns grad_weights, grad_biases aligned with self.weights/self.biases.
+        """
+        layer_idx = activation_index - 1
+        if layer_idx < 0 or layer_idx >= self.n_layers:
+            raise ValueError(
+                f"activation_index={activation_index} invalid for n_layers={self.n_layers}"
+            )
+
+        grad_weights = [np.zeros_like(W) for W in self.weights]
+        grad_biases = [np.zeros_like(b) for b in self.biases]
+        delta = np.asarray(dL_da, dtype=float).copy()
+
+        for i in range(layer_idx, -1, -1):
+            a_prev = self.activations[i]
+            grad_weights[i] = np.outer(a_prev, delta)
+            grad_biases[i] = delta.copy()
+            if i > 0:
+                delta = self.weights[i] @ delta
+                delta = delta * self._activation_derivative(self.pre_activations[i - 1])
+
+        return grad_weights, grad_biases
+    
     def get_flat_params(self):
         """Flatten all parameters into a single vector."""
         params = []
@@ -1132,6 +1639,9 @@ class TrainingHistory:
         self.noise_scale_history = []
         self.loss_by_class = [[] for _ in range(self.n_classes)]
         self.param_stats_history = []  # (min, max, mean) tuples
+        self.regularizer_history = []  # List of dicts with regularizer values per batch
+        self.reg_schedule_history = []  # Regularization schedule factor per batch
+        self.n_integration_timeouts = 0
     
     def record_batch(self, 
                      avg_loss: float,
@@ -1139,7 +1649,9 @@ class TrainingHistory:
                      grad_norms: dict,
                      temperature: float = None,
                      noise_scale: float = None,
-                     param_stats: Tuple[float, float, float] = None):
+                     param_stats: Tuple[float, float, float] = None,
+                     regularizer_values: dict = None,
+                     reg_schedule_factor: float = None):
         """Record metrics for a batch."""
         self.loss_history.append(avg_loss)
         self.accuracy_history.append(accuracy)
@@ -1151,6 +1663,10 @@ class TrainingHistory:
             self.noise_scale_history.append(noise_scale)
         if param_stats is not None:
             self.param_stats_history.append(param_stats)
+        if regularizer_values is not None:
+            self.regularizer_history.append(regularizer_values)
+        if reg_schedule_factor is not None:
+            self.reg_schedule_history.append(reg_schedule_factor)
     
     def record_sample_loss(self, class_idx: int, loss: float):
         """Record loss for a specific class sample."""
@@ -1163,6 +1679,27 @@ class TrainingHistory:
             return 0.0
         window = min(window, len(history))
         return np.mean(history[-window:])
+    
+    def get_recent_avg_regularizer(self, reg_name: str, window: int = 100) -> float:
+        """Get recent average of a regularizer value."""
+        if len(self.regularizer_history) == 0:
+            return 0.0
+        window = min(window, len(self.regularizer_history))
+        recent = self.regularizer_history[-window:]
+        values = [r.get(reg_name, 0.0) for r in recent]
+        return np.mean(values) if values else 0.0
+
+    def get_regularizer_series(self, reg_name: str = None) -> Dict[str, List[float]]:
+        """Return per-batch regularizer metric series for plotting."""
+        if len(self.regularizer_history) == 0:
+            return {}
+        names = [reg_name] if reg_name else sorted({
+            k for batch in self.regularizer_history for k in batch.keys()
+        })
+        return {
+            name: [batch.get(name, np.nan) for batch in self.regularizer_history]
+            for name in names
+        }
     
     def print_summary(self, training_time: float = None):
         """Print training summary statistics."""
@@ -1184,6 +1721,107 @@ class TrainingHistory:
         if len(self.param_stats_history) > 0:
             pmin, pmax, pmean = self.param_stats_history[-1]
             print(f"Final param range: [{pmin:.2e}, {pmax:.2e}], mean: {pmean:.2e}")
+        
+        if len(self.regularizer_history) > 0:
+            print(f"\nRegularizer Metrics (raw values, not weighted):")
+            # Get all regularizer names
+            all_reg_names = set()
+            for reg_dict in self.regularizer_history:
+                all_reg_names.update(reg_dict.keys())
+            
+            for reg_name in sorted(all_reg_names):
+                recent_avg = self.get_recent_avg_regularizer(reg_name, window=100)
+                print(f"  {reg_name}: {recent_avg:.4f} (avg last 100 batches)")
+        
+        n_timeouts = getattr(self, 'n_integration_timeouts', 0)
+        print(f"ODE integration timeouts: {n_timeouts}")
+
+
+def plot_regularizer_history(history: TrainingHistory,
+                             reg_names: List[str] = None,
+                             title: str = "Regularizer Metrics During Training",
+                             target_lines: Dict[str, float] = None,
+                             figsize: Tuple[int, int] = (8, 4),
+                             smoothing_window: int = None,
+                             ax=None,
+                             show: bool = True):
+    """
+    Plot raw regularizer metric values recorded each batch (e.g. hidden IPR).
+
+    Args:
+        history: TrainingHistory with regularizer_history populated
+        reg_names: subset of regularizer names to plot (default: all)
+        title: plot title
+        target_lines: optional {reg_name: y_value} horizontal reference lines
+        figsize: figure size when ax is None
+        smoothing_window: moving-average window (optional)
+        ax: existing matplotlib axis
+        show: call plt.show()
+
+    Returns:
+        fig, ax
+    """
+    import matplotlib.pyplot as plt
+
+    series = history.get_regularizer_series()
+    if not series:
+        print("No regularizer history to plot.")
+        return None, None
+
+    if reg_names is None:
+        reg_names = sorted(series.keys())
+    else:
+        reg_names = [name for name in reg_names if name in series]
+
+    if len(reg_names) == 0:
+        print("No matching regularizer names in history.")
+        return None, None
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
+    batches = np.arange(len(history.regularizer_history))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(reg_names)))
+
+    for i, name in enumerate(reg_names):
+        values = np.asarray(series[name], dtype=float)
+        ax.plot(batches, values, alpha=0.25, color=colors[i])
+
+        if smoothing_window is not None and len(values) >= smoothing_window:
+            kernel = np.ones(smoothing_window) / smoothing_window
+            smoothed = np.convolve(values, kernel, mode='valid')
+            ax.plot(
+                batches[smoothing_window - 1:],
+                smoothed,
+                color=colors[i],
+                linewidth=2,
+                label=name,
+            )
+        else:
+            ax.plot(batches, values, color=colors[i], linewidth=1.5, label=name)
+
+        if target_lines and name in target_lines:
+            ax.axhline(
+                target_lines[name],
+                color=colors[i],
+                linestyle='--',
+                alpha=0.7,
+                label=f'{name} target',
+            )
+
+    ax.set_xlabel('Batch')
+    ax.set_ylabel('Metric value')
+    ax.set_title(title)
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    if show:
+        plt.show()
+
+    return fig, ax
 
 
 def plot_training_diagnostics(history: TrainingHistory,
@@ -1216,8 +1854,11 @@ def plot_training_diagnostics(history: TrainingHistory,
     has_grad_norms = len(history.grad_norm_history) > 0
     has_class_loss = any(len(losses) > 0 for losses in history.loss_by_class)
     has_annealing = len(history.temperature_history) > 0 or len(history.noise_scale_history) > 0
+    has_regularizers = len(history.regularizer_history) > 0 and any(
+        len(batch) > 0 for batch in history.regularizer_history
+    )
     
-    n_plots = 2 + int(has_grad_norms) + int(has_class_loss or has_annealing)
+    n_plots = 2 + int(has_grad_norms) + int(has_class_loss or has_annealing) + int(has_regularizers)
     n_rows = (n_plots + 1) // 2
     
     fig, axes = plt.subplots(n_rows, 2, figsize=figsize)
@@ -1345,6 +1986,17 @@ def plot_training_diagnostics(history: TrainingHistory,
         
         plot_idx += 1
     
+    # ===== Regularizer metrics (e.g. hidden IPR) =====
+    if has_regularizers:
+        ax = axes[plot_idx]
+        plot_regularizer_history(
+            history,
+            ax=ax,
+            title='Regularizer Metrics',
+            show=False,
+        )
+        plot_idx += 1
+    
     # Hide unused axes
     for i in range(plot_idx, len(axes)):
         axes[i].set_visible(False)
@@ -1437,10 +2089,167 @@ def generate_lognormal_mixture(
             cov = np.diag(np.array(var).flatten())
         
         log_samples = np.random.multivariate_normal(mu, cov, n_samples_per_class)
-        samples = np.exp(log_samples)
+        samples = np.power(10, log_samples)  # Changed from np.exp to base-10
         data_list.append([sample for sample in samples])
     
     return n_classes, data_list
+
+
+def _assign_modes_to_labels(n_modes: int, n_classes: int, rng=None) -> list:
+    """Assign modes to class labels as evenly as possible; remainder is random."""
+    base, remainder = divmod(n_modes, n_classes)
+    mode_labels = []
+    for label in range(n_classes):
+        mode_labels.extend([label] * base)
+    if remainder > 0:
+        extra_labels = (rng or np.random).choice(n_classes, size=remainder, replace=False)
+        mode_labels.extend(extra_labels.tolist())
+    (rng or np.random).shuffle(mode_labels)
+    return mode_labels
+
+
+def _merge_modes_to_labels(mode_data_list: list, mode_labels: list, n_classes: int) -> list:
+    """Concatenate per-mode samples into per-label lists."""
+    merged = [[] for _ in range(n_classes)]
+    for mode_idx, samples in enumerate(mode_data_list):
+        merged[mode_labels[mode_idx]].extend(samples)
+    return merged
+
+
+def convert_input_data_to_log_scale(input_data):
+    """
+    Convert InputData from linear scale to log scale.
+    
+    Takes an InputData object where data is in linear space (after 10^x transform)
+    and returns a new InputData object with log10-transformed data.
+    
+    Args:
+        input_data: InputData object with data in linear scale
+        
+    Returns:
+        InputData object with data in log10 scale
+    """
+    from CRNs.utils import InputData
+    
+    log_data_list = []
+    for class_data in input_data.data_list:
+        log_class_data = []
+        for sample in class_data:
+            log_sample = np.log10(np.asarray(sample))  # Changed from np.log to np.log10
+            log_class_data.append(log_sample)
+        log_data_list.append(log_class_data)
+    
+    return InputData(
+        n_classes=input_data.n_classes,
+        data_list=log_data_list,
+        split_fac=input_data.split_fac
+    )
+
+
+def generate_lognormal_mixture_lattice_centers(
+    n_classes: int,
+    n_samples_per_class: int,
+    input_dim: int = 1,
+    center_variance: float = 1.0,
+    log_variance: float = 0.3,
+    center_offset: float = 3.0,
+    n_modes: int = None,
+    random_state: int = None,
+    p_mode_keep: float = 1.0,
+    merge_modes: bool = True,
+):
+    """
+    Generate lognormal mixture with centers arranged in a regular hyperlattice in log10-space.
+    
+    The number of modes must be a perfect power of the dimension (e.g., 8 = 2^3 for 3D).
+    Centers are arranged in a regular grid with spacing determined by center_variance.
+    Within each class, points are drawn with log_variance spread.
+    Data is sampled in log10-space and then transformed via 10^x.
+    
+    Args:
+        n_classes: Number of output classes
+        n_samples_per_class: Samples per mode
+        input_dim: Dimensionality of the data
+        center_variance: TOTAL variance for lattice spacing in log10-space (divided by input_dim)
+        log_variance: TOTAL variance for sampling within each class (divided by input_dim)
+        center_offset: Center position in log10-space
+        n_modes: Number of Gaussian modes. Must be a perfect power of input_dim
+        random_state: Random seed
+        p_mode_keep: Fraction of modes to keep (1.0=all, 0.5=randomly keep half)
+        merge_modes: if False, return one list per mode instead of merging into n_classes
+        
+    Returns:
+        n_classes, data_list, log_means (log_means are in log10-space)
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+
+    if n_modes is None:
+        n_modes = n_classes
+    elif n_modes < n_classes:
+        raise ValueError(f"n_modes ({n_modes}) must be >= n_classes ({n_classes})")
+    
+    # Check that n_modes is a perfect power of input_dim
+    grid_size_per_dim = round(n_modes ** (1.0 / input_dim))
+    if grid_size_per_dim ** input_dim != n_modes:
+        raise ValueError(
+            f"n_modes ({n_modes}) must be a perfect {input_dim}-th power. "
+            f"For dim={input_dim}, try n_modes={grid_size_per_dim**input_dim} "
+            f"(={grid_size_per_dim}^{input_dim})"
+        )
+    
+    # Scale variances by dimension
+    per_dim_center_variance = center_variance / input_dim
+    per_dim_log_variance = log_variance / input_dim
+    
+    # Generate lattice coordinates
+    # Create grid points from 0 to (grid_size_per_dim - 1) in each dimension
+    grid_coords = np.meshgrid(*[np.arange(grid_size_per_dim) for _ in range(input_dim)], indexing='ij')
+    grid_coords = np.stack([g.flatten() for g in grid_coords], axis=1)
+    
+    # Center the grid and scale by center_variance
+    # The lattice spacing is sqrt(per_dim_center_variance)
+    lattice_spacing = np.sqrt(per_dim_center_variance)
+    grid_coords_centered = (grid_coords - (grid_size_per_dim - 1) / 2.0) * lattice_spacing
+    
+    # Generate log_means at lattice points
+    log_means = []
+    for i in range(n_modes):
+        log_mean = grid_coords_centered[i] + center_offset
+        log_means.append(log_mean)
+    
+    # Randomly delete modes if p_mode_keep < 1.0
+    if p_mode_keep < 1.0:
+        n_modes_full = len(log_means)
+        n_modes_keep = max(1, int(np.round(n_modes_full * p_mode_keep)))
+        
+        # Randomly select which modes to keep (use random_state + 1 for mode selection)
+        rng = np.random.default_rng(random_state + 1 if random_state is not None else None)
+        kept_indices = np.sort(rng.choice(n_modes_full, n_modes_keep, replace=False))
+        
+        # Filter log_means
+        log_means = [log_means[i] for i in kept_indices]
+        n_modes = len(log_means)
+    
+    # Use per_dim_log_variance for the spread within each mode
+    log_variances = [per_dim_log_variance] * n_modes
+    
+    _, mode_data_list = generate_lognormal_mixture(
+        n_classes=n_modes,
+        n_samples_per_class=n_samples_per_class,
+        input_dim=input_dim,
+        log_means=log_means,
+        log_variances=log_variances,
+        random_state=None
+    )
+
+    if (not merge_modes) or n_modes == n_classes:
+        data_list = mode_data_list
+    else:
+        mode_labels = _assign_modes_to_labels(n_modes, n_classes)
+        data_list = _merge_modes_to_labels(mode_data_list, mode_labels, n_classes)
+    
+    return n_classes, data_list, log_means
 
 
 def generate_lognormal_mixture_random_centers(
@@ -1450,38 +2259,145 @@ def generate_lognormal_mixture_random_centers(
     center_variance: float = 1.0,
     log_variance: float = 0.3,
     center_offset: float = 3.0,
-    random_state: int = None
+    n_modes: int = None,
+    random_state: int = None,
+    merge_modes: bool = True,
 ):
     """
+    Generate lognormal mixture with randomly placed centers in log10-space.
+    
     Both center_variance and log_variance are TOTAL variances.
     They are divided by input_dim to get per-dimension variance,
     ensuring comparable spread across different dimensionalities.
+    Data is sampled in log10-space and then transformed via 10^x.
+
+    Args:
+        n_modes: Number of Gaussian modes (clouds) in log10-space. Defaults to
+            n_classes (one mode per label). When n_modes > n_classes, modes are
+            assigned to labels as evenly as possible; any remainder modes are
+            assigned to randomly chosen labels. n_samples_per_class is per mode.
+        merge_modes: if False, return one list per mode instead of merging into n_classes
+            
+    Returns:
+        n_classes, data_list, log_means (log_means are in log10-space)
     """
     if random_state is not None:
         np.random.seed(random_state)
+
+    if n_modes is None:
+        n_modes = n_classes
+    elif n_modes < n_classes:
+        raise ValueError(f"n_modes ({n_modes}) must be >= n_classes ({n_classes})")
     
     # Scale both by dimension for comparable total variance
     per_dim_center_variance = center_variance / input_dim
     per_dim_log_variance = log_variance / input_dim
     
     log_means = []
-    for c in range(n_classes):
+    for _ in range(n_modes):
         center = np.random.normal(0, np.sqrt(per_dim_center_variance), size=input_dim)
         log_mean = center + center_offset
         log_means.append(log_mean)
     
-    log_variances = [per_dim_log_variance] * n_classes
+    log_variances = [per_dim_log_variance] * n_modes
     
-    n_classes_out, data_list = generate_lognormal_mixture(
-        n_classes=n_classes,
+    _, mode_data_list = generate_lognormal_mixture(
+        n_classes=n_modes,
         n_samples_per_class=n_samples_per_class,
         input_dim=input_dim,
         log_means=log_means,
         log_variances=log_variances,
         random_state=None
     )
+
+    if (not merge_modes) or n_modes == n_classes:
+        data_list = mode_data_list
+    else:
+        mode_labels = _assign_modes_to_labels(n_modes, n_classes)
+        data_list = _merge_modes_to_labels(mode_data_list, mode_labels, n_classes)
     
-    return n_classes_out, data_list, log_means
+    return n_classes, data_list, log_means
+
+
+def generate_cartesian_alphabet_data(
+    Q: int,
+    L: int,
+    N: int,
+    C: int,
+    M: int,
+    n_samples_per_class: int,
+    log_variance: float = 0.3,
+    center_variance: float = 1.0,
+    random_state=None,
+):
+    """
+    Build LN-dimensional training data from concatenated alphabet vectors.
+    Data is sampled in log10-space and transformed via 10^x.
+
+    Hyperparameters
+    ---------------
+    Q : alphabet size
+    L : number of vector blocks (psi_l for l = 0..L-1)
+    N : length of each block vector
+    C : number of class labels
+    M : distinct vectors sampled per block (M <= Q^N)
+    n_samples_per_class : total noisy samples per class label
+    log_variance : total log10-space variance for sampling within each center
+    center_variance : total variance for alphabet/center separation in log10-space
+
+    Returns
+    -------
+    C, data_list, log_means, alphabet, psi, mode_labels
+        data_list[c]     = n_samples_per_class noisy samples for class c
+        log_means[k]     = log10 of the k-th concatenated center (length L*N)
+        psi[l]           = (M, N) sampled vectors for block l
+        mode_labels[k]   = class label assigned to center k
+    """
+    rng = np.random.default_rng(random_state)
+
+    input_dim = L * N
+    n_possible = Q ** N
+    if M > n_possible:
+        raise ValueError(f"M={M} exceeds Q^N={n_possible}")
+
+    log_spacing = np.sqrt(center_variance / input_dim)
+    log_alphabet = (np.arange(Q) - (Q - 1) / 2.0) * log_spacing
+    alphabet = np.power(10, log_alphabet)  # Changed from np.exp to base-10
+
+    def index_to_vector(flat_idx: int) -> np.ndarray:
+        digits = np.unravel_index(flat_idx, (Q,) * N)
+        return alphabet[np.asarray(digits)]
+
+    psi = []
+    for _ in range(L):
+        chosen = rng.choice(n_possible, size=M, replace=False)
+        psi.append(np.stack([index_to_vector(i) for i in chosen], axis=0))
+
+    centers = []
+    for combo in product(range(M), repeat=L):
+        blocks = [psi[l][combo[l]] for l in range(L)]
+        centers.append(np.concatenate(blocks))
+    centers = np.asarray(centers)
+
+    n_modes = len(centers)
+    if n_modes < C:
+        raise ValueError(f"M^L={n_modes} must be >= C={C} for balanced label assignment")
+
+    mode_labels = _assign_modes_to_labels(n_modes, C, rng)
+    log_means = [np.log10(center) for center in centers]  # Changed from np.log to np.log10
+
+    per_dim_var = log_variance / input_dim
+    cov = per_dim_var * np.eye(input_dim)
+
+    data_list = [[] for _ in range(C)]
+    for c in range(C):
+        center_idxs = np.flatnonzero(np.asarray(mode_labels) == c)
+        chosen_centers = rng.choice(center_idxs, size=n_samples_per_class, replace=True)
+        for k in chosen_centers:
+            log_sample = rng.multivariate_normal(log_means[k], cov)
+            data_list[c].append(np.power(10, log_sample))  # Changed from np.exp to base-10
+
+    return C, data_list, log_means, alphabet, psi, mode_labels
 
 
 def project_data_list(data_list, d):
@@ -1554,7 +2470,12 @@ def generate_multitask_data(
     l0_log_mean: float = 0.0,
     l0_log_std: float = 1.0,
     base_seed: int = None,
-    permute_labels_only: bool = False
+    permute_labels_only: bool = False,
+    resample_mode_labels: bool = False,
+    data_gen_method: str = 'random',
+    n_modes: int = None,
+    p_mode_keep: float = 1.0,
+    log_scale: bool = True,
 ) -> MultiTaskInputData:
     """
     Generate multi-task data with random l0 values for internal nodes.
@@ -1568,41 +2489,71 @@ def generate_multitask_data(
         center_variance: variance for class center generation
         log_variance: variance within each class
         center_offset: offset for log means
-        n_nodes: total number of nodes in graph
+        n_nodes: total number of conservation-law / graph nodes
         NR: number of input (receptor) nodes
-        hidden_dim: number of hidden nodes
+        hidden_dim: unused for l0 slicing; kept for API compatibility
         input_data_class: InputData class to use for wrapping data
         l0_log_mean: mean of log(l0) for internal nodes
         l0_log_std: std of log(l0) for internal nodes
         base_seed: random seed for reproducibility
-        permute_labels_only: if True, use same data clouds for all tasks but
-            randomly permute class labels. This creates truly conflicting tasks
-            that require different l0 to solve.
+        permute_labels_only: keep the same class clouds and only permute class
+            IDs. Mode groups that were merged into a class stay together
+            (a class-id swap). Ignored when resample_mode_labels is True.
+        resample_mode_labels: keep the same modes but redraw which modes map
+            to which class on each task. Modes that shared a label on one
+            task may be split or regrouped on another. Only differs from
+            permute_labels_only when n_modes > n_classes; if n_modes ==
+            n_classes both options are a label permutation.
+        data_gen_method: 'random' (GMM) or 'lattice'
+        n_modes: number of mixture modes (defaults to n_classes)
+        p_mode_keep: fraction of lattice modes to keep
+        log_scale: if False, convert samples to log10 space after generation
         
     Returns:
         MultiTaskInputData container
     """
     import random as random_module
-    
-    tasks = {}
-    
-    # If permute_labels_only, generate data once and reuse with permuted labels
-    if permute_labels_only:
-        # Generate data clouds once using base_seed
-        data_seed = base_seed if base_seed is not None else 42
-        np.random.seed(data_seed)
-        random_module.seed(data_seed)
-        
-        _, base_data_list, base_log_means = generate_lognormal_mixture_random_centers(
+
+    def _generate_clouds(random_state, merge_modes=True):
+        kwargs = dict(
             n_classes=n_classes,
+            n_modes=n_modes,
             n_samples_per_class=n_samples_per_class,
             input_dim=input_dim,
             center_variance=center_variance,
             log_variance=log_variance,
             center_offset=center_offset,
-            random_state=data_seed
+            random_state=random_state,
+            merge_modes=merge_modes,
         )
-        base_data_list = project_data_list(base_data_list, d=proj_dim)
+        if data_gen_method == 'lattice':
+            _, data_list, log_means = generate_lognormal_mixture_lattice_centers(
+                p_mode_keep=p_mode_keep, **kwargs
+            )
+        else:
+            _, data_list, log_means = generate_lognormal_mixture_random_centers(**kwargs)
+        data_list = project_data_list(data_list, d=proj_dim)
+        return data_list, log_means
+
+    def _wrap_input_data(data_list):
+        input_data = input_data_class(n_classes, data_list)
+        if not log_scale:
+            input_data = convert_input_data_to_log_scale(input_data)
+        return input_data
+    
+    tasks = {}
+    share_clouds = permute_labels_only or resample_mode_labels
+    
+    # Generate modes/class clouds once; each task only remaps labels
+    if share_clouds:
+        data_seed = base_seed if base_seed is not None else 42
+        np.random.seed(data_seed)
+        random_module.seed(data_seed)
+        # resample: keep one list per mode so they can be regrouped.
+        # permute: merge into classes now, then only swap class IDs.
+        base_data_list, base_log_means = _generate_clouds(
+            data_seed, merge_modes=not resample_mode_labels
+        )
     
     for task_idx in range(n_tasks):
         # Set seed for this task if base_seed provided
@@ -1612,43 +2563,42 @@ def generate_multitask_data(
             np.random.seed(task_seed)
             random_module.seed(task_seed)
         
-        if permute_labels_only:
-            # Use same data but with permuted labels
-            # Generate a random permutation for this task
+        permutation = None
+        mode_labels = None
+
+        if resample_mode_labels:
+            # Same modes; new partition of modes into classes
+            n_modes_actual = len(base_data_list)
+            mode_labels = _assign_modes_to_labels(n_modes_actual, n_classes)
+            data_list = _merge_modes_to_labels(base_data_list, mode_labels, n_classes)
+            log_means = base_log_means
+            input_data = _wrap_input_data(data_list)
+        elif permute_labels_only:
+            # Same class bundles; only the class IDs are shuffled
             permutation = list(range(n_classes))
             random_module.shuffle(permutation)
             
-            # Reorder data_list according to permutation
-            # permutation[new_label] = old_label means class new_label gets data from old_label
+            # permutation[new_label] = old_label: class new_label gets the
+            # entire old_label cloud (all modes already merged into that class)
             permuted_data_list = [base_data_list[permutation[i]] for i in range(n_classes)]
-            permuted_log_means = [base_log_means[permutation[i]] for i in range(n_classes)]
+            if len(base_log_means) == n_classes:
+                log_means = [base_log_means[permutation[i]] for i in range(n_classes)]
+            else:
+                # Per-mode means (e.g. lattice with n_modes != n_classes)
+                log_means = base_log_means
             
-            input_data = input_data_class(n_classes, permuted_data_list)
-            log_means = permuted_log_means
+            input_data = _wrap_input_data(permuted_data_list)
         else:
-            # Generate fresh data clouds for this task
-            _, data_list, log_means = generate_lognormal_mixture_random_centers(
-                n_classes=n_classes,
-                n_samples_per_class=n_samples_per_class,
-                input_dim=input_dim,
-                center_variance=center_variance,
-                log_variance=log_variance,
-                center_offset=center_offset,
-                random_state=task_seed
-            )
-            
-            # Project to lower dimension
-            data_list = project_data_list(data_list, d=proj_dim)
-            input_data = input_data_class(n_classes, data_list)
-            permutation = None
+            # Fresh clouds (new centers) for this task
+            data_list, log_means = _generate_clouds(task_seed)
+            input_data = _wrap_input_data(data_list)
         
-        # Generate l0 values
+        # Generate l0 values. Randomize non-input, non-output conservation laws
+        # (matches CRNModel.l0_train_range; covers hidden_depth > 1 and MP extras).
         l0 = np.ones(n_nodes)
-        
-        # Randomize internal nodes only (indices NR to NR + hidden_dim)
         internal_start = NR
-        internal_end = NR + hidden_dim
-        n_internal = internal_end - internal_start
+        internal_end = n_nodes - n_classes
+        n_internal = max(0, internal_end - internal_start)
         
         # Log-normal distribution for l0 at internal nodes
         if n_internal > 0:
@@ -1664,6 +2614,7 @@ def generate_multitask_data(
             'log_means': log_means,
             'seed': task_seed,
             'permutation': permutation,  # Store permutation for debugging
+            'mode_labels': mode_labels,
         }
     
     return MultiTaskInputData(tasks)
@@ -1721,9 +2672,12 @@ def run_training_crn_multitask(
     start_time = time.time()
     
     if verbose:
-        model_type = "CRN"
         if hasattr(trainer.model, 'forward_method'):
             model_type = f"CRN ({trainer.model.forward_method})"
+        elif hasattr(trainer.model, 'mlp'):
+            model_type = "MLP"
+        else:
+            model_type = "model"
         print(f"Starting {model_type} multi-task training: {num_batches} batches, "
               f"batch_size={batch_size}, n_tasks={multi_task_data.n_tasks}")
         print("=" * 80)
@@ -1737,16 +2691,18 @@ def run_training_crn_multitask(
         batch_correct = 0
         batch_valid = 0
         batch_grad_norms = None
+        batch_reg_values = {}  # Accumulate regularizer values
         
         for sample in range(batch_size):
             # Sample a task
             task_id = multi_task_data.sample_task()
             
-            # Set l0 for this task (context switch)
-            trainer.model._default_l0 = multi_task_data.get_l0(task_id).copy()
+            # Set l0 for this task (context switch). MLP has no per-task l0.
+            if hasattr(trainer.model, '_default_l0'):
+                trainer.model._default_l0 = multi_task_data.get_l0(task_id).copy()
             
             # Debug: verify l0 is being set correctly
-            if debug_l0 and batch == 0 and sample < 5:
+            if debug_l0 and batch == 0 and sample < 5 and hasattr(trainer.model, '_default_l0'):
                 n_inputs = trainer.model.n_inputs
                 n_classes_model = trainer.model.n_classes
                 internal_l0 = trainer.model._default_l0[n_inputs:-n_classes_model] if n_classes_model > 0 else trainer.model._default_l0[n_inputs:]
@@ -1757,7 +2713,7 @@ def run_training_crn_multitask(
             inputs = multi_task_data.get_next_training_sample(task_id, target_idx)
             
             try:
-                loss, probs, grad_norms = trainer.train_step(
+                loss, probs, grad_norms, reg_values = trainer.train_step(
                     inputs=inputs,
                     target_idx=target_idx,
                     temperature=temperature,
@@ -1786,6 +2742,14 @@ def run_training_crn_multitask(
                 batch_valid += 1
                 batch_grad_norms = grad_norms
                 
+                # Accumulate regularizer values (multitask version)
+                for reg_name, reg_value in reg_values.items():
+                    if reg_name not in batch_reg_values:
+                        batch_reg_values[reg_name] = 0.0
+                    batch_reg_values[reg_name] += reg_value
+                
+            except TimeoutError:
+                continue
             except Exception as e:
                 if verbose:
                     print(f"  Warning: Training step failed at batch {batch}, sample {sample}: {e}")
@@ -1806,6 +2770,12 @@ def run_training_crn_multitask(
             param_values = np.concatenate([p.flatten() for p in params.values()])
             param_stats = (param_values.min(), param_values.max(), param_values.mean())
         
+        # Average regularizer values
+        avg_reg_values = {name: val / batch_valid for name, val in batch_reg_values.items()}
+        
+        # Get current regularization schedule factor
+        reg_schedule_factor = trainer.get_regularizer_schedule_factor(batch)
+        
         # Record batch metrics
         history.record_batch(
             avg_loss=batch_loss / batch_valid,
@@ -1813,7 +2783,9 @@ def run_training_crn_multitask(
             grad_norms=batch_grad_norms if batch_grad_norms else {},
             temperature=temperature,
             noise_scale=noise_scale,
-            param_stats=param_stats
+            param_stats=param_stats,
+            regularizer_values=avg_reg_values,
+            reg_schedule_factor=reg_schedule_factor
         )
         
         # Print diagnostics
@@ -1825,14 +2797,26 @@ def run_training_crn_multitask(
             if batch_grad_norms:
                 grad_str = " ".join([f"{k[:6]}:{v:.2e}" for k, v in batch_grad_norms.items()])
             
+            # Build regularizer string (multitask version)
+            reg_str = ""
+            if avg_reg_values:
+                reg_str = " | " + ", ".join([f"{k}:{v:.4f}" for k, v in avg_reg_values.items()])
+            
+            # Add regularization schedule info if using schedule
+            if trainer.reg_schedule_type != 'none' and avg_reg_values:
+                reg_str += f" | RegSched: {reg_schedule_factor:.2f}"
+            
             pmin, pmax, _ = param_stats
             print(f"Batch {batch:4d}/{num_batches} | "
                   f"Loss: {batch_loss/batch_valid:.4f} (avg: {recent_loss:.4f}) | "
                   f"Acc: {batch_correct/batch_valid:.1%} (avg: {recent_acc:.1%}) | "
                   f"{grad_str} | "
-                  f"Rates: [{pmin:.2e}, {pmax:.2e}]")
+                  f"Rates: [{pmin:.2e}, {pmax:.2e}]"
+                  f"{reg_str}")
     
     training_time = time.time() - start_time
+    if hasattr(trainer.model, 'n_integration_timeouts'):
+        history.n_integration_timeouts = trainer.model.n_integration_timeouts
     
     if verbose:
         print("=" * 80)

@@ -415,9 +415,36 @@ class NetworkDataLogger:
             filepath: Optional path to a saved data file to load
         """
         self.network_data = []
+        self.shared = {}
         
         if filepath is not None:
             self.load_data(filepath)
+
+    @staticmethod
+    def extract_network_params(r_n, include_rates: bool = False):
+        """Topology fields needed to reconstruct a ReactionNetwork."""
+        network_params = {
+            'all_complexes': r_n.all_complexes,
+            'n_species': r_n.n_species,
+            'n_complexes': r_n.n_complexes,
+            'n_reactions': r_n.n_reactions,
+            'n_lcs': r_n.n_lcs,
+            'L': r_n.L,
+            'complexes_per_class': r_n.complexes_per_class,
+            'reactions_per_class': r_n.reactions_per_class,
+            'force_reverse': r_n.force_reverse,
+            'subset_group_ind': r_n.subset_group_ind,
+            'reaction_strings': r_n.get_reaction_strings_simple(include_reverse=False),
+            'species_names': r_n.species_names,
+            'seed': r_n.seed,
+        }
+        if include_rates:
+            network_params['reactions'] = r_n.reactions
+        return network_params
+
+    def set_shared(self, **kwargs):
+        """Store fields that are identical across samples (topology, scan config)."""
+        self.shared.update(kwargs)
         
     def log_network(self, **kwargs):
         """
@@ -443,23 +470,9 @@ class NetworkDataLogger:
         # If r_n is provided, extract network parameters for reconstruction
         if 'r_n' in kwargs:
             r_n = kwargs['r_n']
-            network_params = {
-                'all_complexes': r_n.all_complexes,
-                'reactions': r_n.reactions,
-                'n_species': r_n.n_species,
-                'n_complexes': r_n.n_complexes,
-                'n_reactions': r_n.n_reactions,
-                'n_lcs': r_n.n_lcs,
-                'L': r_n.L,
-                'complexes_per_class': r_n.complexes_per_class,
-                'reactions_per_class': r_n.reactions_per_class,
-                'force_reverse': r_n.force_reverse,
-                'subset_group_ind': r_n.subset_group_ind,
-                'reaction_strings': r_n.get_reaction_strings_simple(include_reverse=False),
-                'species_names': r_n.species_names,
-                'seed': r_n.seed
-            }
-            data_entry['network_params'] = network_params
+            data_entry['network_params'] = self.extract_network_params(
+                r_n, include_rates=True
+            )
         
         self.network_data.append(data_entry)
         
@@ -468,7 +481,8 @@ class NetworkDataLogger:
 
 
         save_data = {
-            'network_data': self.network_data
+            'network_data': self.network_data,
+            'shared': self.shared,
         }
             
         with open(filepath, "wb") as file:
@@ -483,15 +497,20 @@ class NetworkDataLogger:
             loaded_data = pickle.load(file)
             
         self.network_data = loaded_data['network_data']
+        self.shared = loaded_data.get('shared', {})
             
         print(f"Data loaded from {filepath}")
         
-    def get_network_by_index(self, index: int):
-
-        if 0 <= index < len(self.network_data):
-            return self.network_data[index]
-        else:
+    def get_network_by_index(self, index: int, merge_shared: bool = True):
+        """Return one sample. If merge_shared, overlay logger.shared (sample keys win)."""
+        if not (0 <= index < len(self.network_data)):
             raise IndexError(f"Network index {index} out of range (0-{len(self.network_data)-1})")
+        entry = self.network_data[index]
+        if merge_shared and self.shared:
+            merged = dict(self.shared)
+            merged.update(entry)
+            return merged
+        return entry
             
     def filter_networks(self, **criteria):
 
@@ -511,6 +530,7 @@ class NetworkDataLogger:
     def clear_data(self):
         """Clear all logged data."""
         self.network_data = []
+        self.shared = {}
     
     def reconstruct_network(self, index: int, random_rates: bool = True):
         """
@@ -535,7 +555,12 @@ class NetworkDataLogger:
             raise ImportError("ReactionNetwork class not available. Make sure CRNs.reaction_network is importable.")
         
         if 0 <= index < len(self.network_data):
-            network_params = self.network_data[index]['network_params']
+            entry = self.network_data[index]
+            network_params = entry.get('network_params') or self.shared.get('network_params')
+            if network_params is None:
+                raise KeyError(
+                    "network_params not found on this sample or in logger.shared."
+                )
             
             if 'reaction_strings' not in network_params:
                 raise KeyError("reaction_strings not found in network_params. Make sure to log networks with reaction strings.")
@@ -546,7 +571,10 @@ class NetworkDataLogger:
             force_reverse = network_params.get('force_reverse', True)
             subset_group_ind = network_params.get('subset_group_ind')
             species_names = network_params.get('species_names')
-            rates = [r[2] for r in network_params.get('reactions')]
+            if 'rates' in entry:
+                rates = list(entry['rates'])
+            else:
+                rates = [r[2] for r in network_params.get('reactions')]
             r_n = ReactionNetwork.from_reaction_strings(
                 reaction_strings, L, seed, force_reverse, subset_group_ind, 
                 random_rates, species_names
@@ -928,10 +956,15 @@ class GridSampler:
                 self.profiler.end_timer("adaptive_initial_conditions")
                 self.profiler.start_timer("adaptive_integration")
             
-            # Set up timeout for integration
-            if self.use_signal_alarms:
+            use_timeout = (
+                self.use_signal_alarms
+                and self.timeout_seconds is not None
+                and self.timeout_seconds > 0
+                and hasattr(signal, 'SIGALRM')
+            )
+            if use_timeout:
                 signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(self.timeout_seconds)
+                signal.alarm(int(self.timeout_seconds))
             
             try:
                 # Create flexible RHS function
@@ -950,54 +983,49 @@ class GridSampler:
                         rtol=r_tol, 
                         atol=a_tol
                     )
-                
-                if self.use_signal_alarms:
-                    signal.alarm(0)  # Cancel timeout
-                
-                if self.profiler:
-                    self.profiler.end_timer("adaptive_integration")
-                    self.profiler.start_timer("adaptive_species_recovery")
-                
-                # Recover full species concentrations
-                C_full = sim.recover_eliminated_species(l0, C_reduced_final)
-                
-                if self.profiler:
-                    self.profiler.end_timer("adaptive_species_recovery")
-                    self.profiler.start_timer("adaptive_sensitivity_analysis")
-                
-                # Compute sensitivity derivatives (use precomputed if available)
-                rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
-                
-                dR_dC_func, dR_dl_func = precomputed_derivatives
-                
-                dC_dl = sim.dC_dl_func(C_reduced_final, l0, rates, dR_dC_func, dR_dl_func)
-                dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool = True)
-                
-                if self.profiler:
-                    self.profiler.end_timer("adaptive_sensitivity_analysis")
-                    self.profiler.start_timer("adaptive_sign_processing")
-                
-                # Extract sign conditions
-                if self.sc_grad_dims is not None:
-                    # Use only specified dimensions of dC_dl_full
-                    rows, cols = self.sc_grad_dims
-                    dC_dl_subset = dC_dl_full[np.ix_(rows, cols)]
-                    signs = np.sign(np.round(dC_dl_subset, decimals=self.round_decimals)).tolist()
-                else:
-                    # Use all dimensions (original behavior)
-                    signs = np.sign(np.round(dC_dl_full, decimals=self.round_decimals)).tolist()
-                
-                if self.profiler:
-                    self.profiler.end_timer("adaptive_sign_processing")
-                
-                return signs, C_full, dC_dl_full, l0, True
-                
             except TimeoutError:
-                if self.use_signal_alarms:
-                    signal.alarm(0)  # Cancel timeout
                 if self.profiler:
                     self.profiler.end_timer("adaptive_integration")
                 return None, None, None, None, False
+            finally:
+                if use_timeout:
+                    signal.alarm(0)
+            
+            if self.profiler:
+                self.profiler.end_timer("adaptive_integration")
+                self.profiler.start_timer("adaptive_species_recovery")
+            
+            # Recover full species concentrations
+            C_full = sim.recover_eliminated_species(l0, C_reduced_final)
+            
+            if self.profiler:
+                self.profiler.end_timer("adaptive_species_recovery")
+                self.profiler.start_timer("adaptive_sensitivity_analysis")
+            
+            # Compute sensitivity derivatives (use precomputed if available)
+            rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
+            
+            dR_dC_func, dR_dl_func = precomputed_derivatives
+            
+            dC_dl = sim.dC_dl_func(C_reduced_final, l0, rates, dR_dC_func, dR_dl_func)
+            dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool=True)
+            
+            if self.profiler:
+                self.profiler.end_timer("adaptive_sensitivity_analysis")
+                self.profiler.start_timer("adaptive_sign_processing")
+            
+            # Extract sign conditions
+            if self.sc_grad_dims is not None:
+                rows, cols = self.sc_grad_dims
+                dC_dl_subset = dC_dl_full[np.ix_(rows, cols)]
+                signs = np.sign(np.round(dC_dl_subset, decimals=self.round_decimals)).tolist()
+            else:
+                signs = np.sign(np.round(dC_dl_full, decimals=self.round_decimals)).tolist()
+            
+            if self.profiler:
+                self.profiler.end_timer("adaptive_sign_processing")
+            
+            return signs, C_full, dC_dl_full, l0, True
                 
         except Exception as e:
             print(e)
@@ -1057,12 +1085,19 @@ class GridSampler:
                 self.profiler.end_timer("contour_initial_conditions")
                 self.profiler.start_timer("contour_steady_state")
             
-            # Integrate to steady state at the leftmost point
+            use_timeout = (
+                self.use_signal_alarms
+                and self.timeout_seconds is not None
+                and self.timeout_seconds > 0
+                and hasattr(signal, 'SIGALRM')
+            )
+            if use_timeout:
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(int(self.timeout_seconds))
+            
             try:
-                # Create flexible RHS function
+                # Integrate to steady state at the leftmost point
                 flexible_reduced_ode_rhs = sim.make_reduced_rhs_with_conservation_flexible()
-                
-                # Integrate to steady state
                 if self.steady_state_method == 'root_finding':
                     _, C_reduced_steady = sim.minimize_to_steady_state(flexible_reduced_ode_rhs, C_reduced_init, l0_init)
                 else:
@@ -1079,19 +1114,6 @@ class GridSampler:
                 if self.profiler:
                     self.profiler.end_timer("contour_steady_state")
                     self.profiler.start_timer("contour_integration")
-                
-            except Exception as e:
-                print(f"Error in steady state integration: {e}")
-                if self.profiler:
-                    self.profiler.end_timer("contour_steady_state")
-                return [], [], [], [], 0, False
-            
-            # Set up timeout for integration
-            if self.use_signal_alarms:
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(self.timeout_seconds)
-            
-            try:
                 # Get precomputed derivatives
                 dR_dC_func, dR_dl_func = precomputed_derivatives
                 rates = np.array([sim.r_n.reactions[r_idx][2] for r_idx in range(len(sim.r_n.reactions))])
@@ -1130,9 +1152,6 @@ class GridSampler:
                     atol=a_tol
                 )
                 
-                if self.use_signal_alarms:
-                    signal.alarm(0)  # Cancel timeout
-                
                 if self.profiler:
                     self.profiler.end_timer("contour_integration")
                     self.profiler.start_timer("contour_processing")
@@ -1156,7 +1175,7 @@ class GridSampler:
                     
                     # Compute sensitivity derivatives
                     dC_dl = sim.dC_dl_func(C_reduced_current, l0_current, rates, dR_dC_func, dR_dl_func)
-                    dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool=False)
+                    dC_dl_full = sim.compute_dC_dk_full(dC_dl, l_bool=True)
                     
                     # Extract sign conditions
                     if self.sc_grad_dims is not None:
@@ -1187,11 +1206,12 @@ class GridSampler:
                 return sign_conditions, C_full_list, dC_dl_list, l0_list, self.sample_count, True
                 
             except TimeoutError:
-                if self.use_signal_alarms:
-                    signal.alarm(0)  # Cancel timeout
                 if self.profiler:
                     self.profiler.end_timer("contour_integration")
                 return [], [], [], [], 0, False
+            finally:
+                if use_timeout:
+                    signal.alarm(0)
                 
         except Exception as e:
             print(f"Error in contour integration: {e}")
