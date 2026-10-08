@@ -169,20 +169,39 @@ def compute_silhouette_score(activation_arrays):
     score = silhouette_score(X, labels)
     return score
 
-def sample_proteins_and_get_silhouette_score(n_proteins, glycans_in_df, emb, group_indices, df):
+def sample_proteins_and_get_silhouette_score(n_proteins, glycans_in_df, emb, group_indices, df,
+                                            activation_fn=None, alpha=1.0, lam='auto',
+                                            saturate=False):
+    """
+    Draw a random lectin subset and score group separation in activation space.
 
+    By default uses the unsaturated mass-action sum sum p exp(alpha z).
+    Pass saturate=True for Langmuir occupancy. Pass activation_fn=compute_activation
+    to recover the linear z-mixture score.
+    """
     prot_inds = np.random.choice(range(len(gb)), n_proteins, replace=False)
     prot_names = gb['protein'].iloc[prot_inds]
     prot_seq_list = build_prot_seq_list(prot_names)
     z_score_mat = build_z_score_mat(glycans_in_df, prot_seq_list, emb, use_emb = True, force_nearest = False, no_nan = True)
-    activation_arrays = build_activation_arrays(z_score_mat, group_indices, df)
+    if activation_fn is None:
+        activation_arrays = build_activation_arrays_exp_langmuir(
+            z_score_mat, group_indices, df, alpha=alpha, lam=lam, saturate=saturate
+        )
+    else:
+        activation_arrays = build_activation_arrays(z_score_mat, group_indices, df, activation_fn=activation_fn)
     distribution_arrays = build_distribution_arrays(group_indices, df)
     return compute_silhouette_score(activation_arrays), compute_silhouette_score(distribution_arrays), prot_names
 
-def sample_random_matrix_and_get_silhouette_score(n_proteins, glycans_in_df, group_indices, df, random_func=np.random.normal, **random_kwargs):
-
+def sample_random_matrix_and_get_silhouette_score(n_proteins, glycans_in_df, group_indices, df,
+                                                 random_func=np.random.normal, activation_fn=None,
+                                                 alpha=1.0, lam='auto', saturate=False, **random_kwargs):
     z_score_mat = build_random_z_score_mat(glycans_in_df, n_proteins, random_func, **random_kwargs)
-    activation_arrays = build_activation_arrays(z_score_mat, group_indices, df)
+    if activation_fn is None:
+        activation_arrays = build_activation_arrays_exp_langmuir(
+            z_score_mat, group_indices, df, alpha=alpha, lam=lam, saturate=saturate
+        )
+    else:
+        activation_arrays = build_activation_arrays(z_score_mat, group_indices, df, activation_fn=activation_fn)
     return compute_silhouette_score(activation_arrays), z_score_mat
 
 def fit_dirichlet_distribution(df, group_indices, lambda_val = 1):
@@ -223,18 +242,69 @@ def compute_activation(aff_mat, dist_vec, non_sat = False, safe_val=1e-2):
         denominator = 1
     return numerator / denominator
 
-def build_activation_arrays(z_score_mat, group_indices, df):
+def compute_mass_action_sum(z_score_mat, dist_vec, alpha=1.0):
+    """Unsaturated mass-action sum a = sum_i p_i exp(alpha * z_i)."""
+    log_k = np.clip(alpha * np.asarray(z_score_mat, dtype=float), -20.0, 20.0)
+    return np.dot(np.exp(log_k), dist_vec)
+
+def apply_langmuir(a, lam):
+    """theta = (lam * a) / (1 + lam * a). lam may be a scalar or one value per lectin."""
+    a = np.asarray(a, dtype=float)
+    lam = np.asarray(lam, dtype=float)
+    if a.ndim == 2 and lam.ndim == 1:
+        lam = lam.reshape(-1, 1)
+    return (lam * a) / (1.0 + lam * a)
+
+def auto_lam_from_activation_arrays(a_arrays):
+    """Per-lectin lam so the median sample sits at 50% occupancy."""
+    A = np.hstack([np.asarray(arr, dtype=float) for arr in a_arrays.values()])
+    med = np.median(A, axis=1)
+    return 1.0 / np.maximum(med, 1e-12)
+
+def compute_activation_exp_langmuir(z_score_mat, dist_vec, alpha=1.0, lam=1.0, saturate=False):
+    """
+    Mass-action activation from binding z-scores.
+
+    K_i = exp(alpha * z_i)
+    a   = sum_i p_i K_i
+    If saturate is True: theta = (lam * a) / (1 + lam * a)
+
+    Saturation is off by default (unsaturated limit, theta ∝ a).
+    """
+    a = compute_mass_action_sum(z_score_mat, dist_vec, alpha=alpha)
+    if not saturate:
+        return a
+    return apply_langmuir(a, lam)
+
+def build_activation_arrays(z_score_mat, group_indices, df, activation_fn=None):
+    if activation_fn is None:
+        activation_fn = compute_activation
     aff_mat = z_score_mat
     activation_arrays = {}
     for group, col_list in group_indices.items():
         activation_array = np.zeros((aff_mat.shape[0], len(col_list)))
         for i, col in enumerate(col_list):
             glycan_dist = prob_dist(np.array(df[col]))
-            activation_array[:, i] = compute_activation(aff_mat, glycan_dist)
+            activation_array[:, i] = activation_fn(aff_mat, glycan_dist)
         activation_arrays[group] = activation_array
     return activation_arrays
 
-def build_activation_arrays_with_sampling(z_score_mat, group_indices, df, n_samples, lambda_val = 20):
+def build_mass_action_sum_arrays(z_score_mat, group_indices, df, alpha=1.0):
+    def _activation(aff_mat, dist_vec):
+        return compute_mass_action_sum(aff_mat, dist_vec, alpha=alpha)
+    return build_activation_arrays(z_score_mat, group_indices, df, activation_fn=_activation)
+
+def build_activation_arrays_exp_langmuir(z_score_mat, group_indices, df, alpha=1.0, lam='auto', saturate=False):
+    a_arrays = build_mass_action_sum_arrays(z_score_mat, group_indices, df, alpha=alpha)
+    if not saturate:
+        return a_arrays
+    if isinstance(lam, str) and lam == 'auto':
+        lam = auto_lam_from_activation_arrays(a_arrays)
+    return {g: apply_langmuir(arr, lam) for g, arr in a_arrays.items()}
+
+def build_activation_arrays_with_sampling(z_score_mat, group_indices, df, n_samples, lambda_val = 20, activation_fn=None):
+    if activation_fn is None:
+        activation_fn = compute_activation
     group_alphas = fit_dirichlet_distribution(df, group_indices, lambda_val)
     aff_mat = z_score_mat
     activation_arrays = {}
@@ -242,11 +312,13 @@ def build_activation_arrays_with_sampling(z_score_mat, group_indices, df, n_samp
         activation_array = np.zeros((aff_mat.shape[0], n_samples))
         for i in range(n_samples):
             samp = dirichlet.rvs(group_alphas[group], size = 1)[0]
-            activation_array[:, i] = compute_activation(aff_mat, samp)
+            activation_array[:, i] = activation_fn(aff_mat, samp)
         activation_arrays[group] = activation_array
     return activation_arrays
 
-def build_activation_arrays_with_sampling_mle(z_score_mat, group_indices, df, n_samples):
+def build_activation_arrays_with_sampling_mle(z_score_mat, group_indices, df, n_samples, activation_fn=None):
+    if activation_fn is None:
+        activation_fn = compute_activation
     group_alphas = fit_dirichlet_distribution_mle(df, group_indices)
     aff_mat = z_score_mat
     activation_arrays = {}
@@ -254,9 +326,25 @@ def build_activation_arrays_with_sampling_mle(z_score_mat, group_indices, df, n_
         activation_array = np.zeros((aff_mat.shape[0], n_samples))
         for i in range(n_samples):
             samp = dirichlet.rvs(group_alphas[group], size = 1)[0]
-            activation_array[:, i] = compute_activation(aff_mat, samp)
+            activation_array[:, i] = activation_fn(aff_mat, samp)
         activation_arrays[group] = activation_array
     return activation_arrays
+
+def build_activation_arrays_with_sampling_mle_exp_langmuir(z_score_mat, group_indices, df, n_samples, alpha=1.0, lam='auto', saturate=False):
+    def _unsaturated(aff_mat, dist_vec):
+        return compute_mass_action_sum(aff_mat, dist_vec, alpha=alpha)
+
+    a_samp = build_activation_arrays_with_sampling_mle(
+        z_score_mat, group_indices, df, n_samples, activation_fn=_unsaturated
+    )
+    if not saturate:
+        return a_samp
+
+    # Fit lam on real samples so the Dirichlet cloud uses the same scale.
+    a_obs = build_mass_action_sum_arrays(z_score_mat, group_indices, df, alpha=alpha)
+    if isinstance(lam, str) and lam == 'auto':
+        lam = auto_lam_from_activation_arrays(a_obs)
+    return {g: apply_langmuir(arr, lam) for g, arr in a_samp.items()}
 
 def export_data_for_sampling(z_score_mat, group_indices, df, filepath):
     group_alphas = fit_dirichlet_distribution_mle(df, group_indices)

@@ -30,13 +30,13 @@ if seed is not None:
     np.random.seed(seed)
     random.seed(seed)
 
-sample_network_bool = False
+sample_network_bool = True
 
 # Recurrences use p_r; MP options use num_P. Internal/external catalysis
 # require extra phosphoforms, so expand_to_MP runs if either catalysis flag is on.
-p_r = 1.0
-add_recurrences = True          # add backward edges that do not create new I/O paths
-allow_output_recurrence = True  # if False, skip recurrences sourced at output nodes
+p_r = 0.0
+add_recurrences = False          # add backward edges that do not create new I/O paths
+allow_output_recurrence = False  # if False, skip recurrences sourced at output nodes
 expand_to_mp = False             # add phosphoforms S, Ss, ..., up to num_P trailing s's
 num_P = 2                        # max phosphorylation level (Sss when num_P=2)
 expand_mp_external = False       # copy C+Xs->C+X templates onto higher phosphoforms
@@ -47,22 +47,10 @@ n_outputs = 1                    # class/output nodes at S{NS-n_outputs} .. S{NS
 if sample_network_bool:
     ### Signaling network 
     NR = 1
-    # NS = 3
-    # p_f = 0.8
-    # Convert string to list of integers
-    if args.param1 == "n":
-        var = ""
-    else:
-        var = args.param1
+    n_layers = int(args.param1)
+    NS_vec = [1] * n_layers
+    NS = sum(NS_vec)
 
-    #NS_vec = [int(digit) for digit in var]
-    #NS_vec.append(1)
-    #NS = sum(NS_vec)
-
-    p_f = 1.0
-    NS = 5
-
-    # Forward DAG only (p_r=0); recurrences applied below via add_recurrent_connections.
     #species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_dag_signaling_network(NR, NS, p_f, 0.0, include_reverse=False, include_uncatalyzed=True)
     species_names, reaction_strings, L, adjacency_matrix, input_substrates_list = generate_layered_feedforward_signaling_network(NR, NS_vec, p_r, include_reverse=False, include_uncatalyzed=True)
 

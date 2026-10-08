@@ -319,7 +319,7 @@ def generate_initial_concentrations(L, base_concentrations=None, scale=4, offset
     return C
 
 
-def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-8):
+def generate_positive_initial_concentrations_nnls(L, const_vals, min_conc=1e-10):
     n_species = L.shape[1]
     # Start from the NNLS solution as an initial guess
     C0, _ = nnls(L, const_vals)

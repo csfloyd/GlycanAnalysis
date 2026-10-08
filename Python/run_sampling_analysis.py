@@ -12,6 +12,8 @@ import glob
 #analysis_function = "arc_length"
 #analysis_function = "total_absolute_curvature"
 analysis_function = "critical_points"
+eps = 1e-4
+rel_delta_c = 0.0
 #analysis_function = "mlp_width"
 #analysis_function = "pca"
 
@@ -109,7 +111,7 @@ else:
             "num_sign_changes": lambda: count_conservation_group_changes(network_data),
             "mlp_width": lambda: select_best_mlp_width(log_l0_x, C_full_list, width_range=(2, 10), normalize_x=True, random_state=42, r2_threshold = 0.95, quiet = True)['best_width'],
             "sign_conditions": lambda: count_sign_conditions(network_data),
-            "critical_points": lambda: count_critical_points(network_data, target_node_idx = species_names.index(target_node), l0_list = l0_list, fd_comparison = False, eps = 1e-3, min_delta_c = 0.0, rel_delta_c = 0.01) 
+            "critical_points": lambda: count_critical_points(network_data, target_node_idx = species_names.index(target_node), l0_list = l0_list, fd_comparison = False, eps = eps, min_delta_c = 0.0, rel_delta_c = rel_delta_c) 
         }
 
         #if analysis_function in analysis_functions:
